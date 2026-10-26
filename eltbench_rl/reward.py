@@ -67,22 +67,23 @@ class EltReward:
         if not found.stdout.strip():
             return set(), False, False
         project = PurePosixPath(found.stdout.split()[0]).parent
-        # Delete any run_results.json the agent left, so only our own run is trusted.
+        # Delete the artifacts the agent left, so only our own run is trusted.
         result = await self.sandbox.run_command(
-            f"cd {project} && rm -f target/run_results.json && dbt run", timeout=self.dbt_timeout
+            f"cd {project} && rm -f target/run_results.json target/manifest.json && dbt run",
+            timeout=self.dbt_timeout,
         )
 
-        host_project = self.workspace / project.relative_to("/workspace")
-        run_results = host_project / "target" / "run_results.json"
+        target = self.workspace / project.relative_to("/workspace") / "target"
         built = set()
-        if run_results.exists():
-            for node in json.loads(run_results.read_text())["results"]:
+        if (target / "run_results.json").exists():
+            for node in json.loads((target / "run_results.json").read_text())["results"]:
                 if node["unique_id"].startswith("model.") and node["status"] == "success":
                     built.add(node["unique_id"].split(".", 2)[2].lower())
-        # Seed files would let the agent hardcode results instead of computing them from the sources.
-        has_seeds = any(
-            "target" not in path.parts and "dbt_packages" not in path.parts
-            for path in host_project.rglob("*.csv")
+        # Seeds would let the agent hardcode results instead of computing them from the sources.
+        # Ask dbt's own manifest, which finds seeds wherever `seed-paths` points.
+        has_seeds = (target / "manifest.json").exists() and any(
+            node["resource_type"] == "seed"
+            for node in json.loads((target / "manifest.json").read_text())["nodes"].values()
         )
         return built, has_seeds, result.exit_code == 0
 

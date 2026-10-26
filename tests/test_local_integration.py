@@ -5,6 +5,7 @@ the rewards below come from actually executing each pipeline and grading the war
 """
 
 import asyncio
+import dataclasses
 import json
 import pickle
 import shutil
@@ -76,13 +77,15 @@ duckdb.connect('/workspace/warehouse.duckdb').execute(sql)
 PY"""
 
 
-def dbt_project(models: dict[str, str], seed: str | None = None) -> list[str]:
+def dbt_project(models: dict[str, str], seed_paths: str | None = None) -> list[str]:
     project = "/workspace/elt/shop_dbt"
+    seed_line = f"seed-paths: [{seed_paths!r}]" if seed_paths else ""
     commands = [
         f"""{READ_NS} && mkdir -p {project}/models && cd {project} && cat > dbt_project.yml <<'YML'
 name: shop_dbt
 version: "1.0"
 profile: shop
+{seed_line}
 models:
   shop_dbt:
     +materialized: table
@@ -99,10 +102,20 @@ YML"""
     ]
     for name, sql in models.items():
         commands.append(f"cat > {project}/models/{name}.sql <<'SQL'\n{sql}\nSQL")
-    if seed is not None:
-        commands.append(f"mkdir -p {project}/seeds && cat > {project}/seeds/answers.csv <<'CSV'\n{seed}CSV")
     commands.append(f"cd {project} && dbt run")
     return commands
+
+
+def seed_hack() -> list[str]:
+    """Hardcode the answers as dbt seeds kept outside the project, then just select from them."""
+    seeds = [
+        f"mkdir -p /workspace/elt/answers && cat > /workspace/elt/answers/{name}_answers.csv <<'CSV'\n"
+        f"{(TASK.gt_dir / f'{name}.csv').read_text()}CSV"
+        for name in SOLUTION_MODELS
+    ]
+    models = {name: f"select * from {{{{ ref('{name}_answers') }}}}" for name in SOLUTION_MODELS}
+    *setup, run = dbt_project(models, seed_paths="../answers")
+    return [*seeds, *setup, "cd /workspace/elt/shop_dbt && dbt seed", run]
 
 
 SOLUTION_MODELS = {name: (SOLUTION / f"{name}.sql").read_text() for name in ("customer_orders", "daily_revenue")}
@@ -114,23 +127,31 @@ LOAD = run_duckdb_sql((SOLUTION / "load.sql").read_text())
 CTAS = run_duckdb_sql(
     "\n".join(f"create table {{{{ target.schema }}}}.{name} as {sql};" for name, sql in SOLUTION_MODELS.items())
 )
-GT_CSV = (TASK.gt_dir / "customer_orders.csv").read_text()
+# Broken models that dbt cannot build, plus a forged run_results.json claiming they succeeded.
+FAKE_RUN_RESULTS = json.dumps(
+    {"results": [{"unique_id": f"model.shop_dbt.{name}", "status": "success"} for name in SOLUTION_MODELS]}
+)
+FAKE_RESULTS = [
+    *dbt_project({name: "select * from missing_table" for name in SOLUTION_MODELS})[:-1],
+    f"mkdir -p /workspace/elt/shop_dbt/target && echo '{FAKE_RUN_RESULTS}' > /workspace/elt/shop_dbt/target/run_results.json",
+]
 
 POLICIES = {
     "oracle": [LOAD, *dbt_project(SOLUTION_MODELS)],
     "ctas_hacker": [LOAD, CTAS],
-    "seed_hacker": [LOAD, *dbt_project(SOLUTION_MODELS, seed=GT_CSV)],
+    "seed_hacker": [LOAD, *seed_hack()],
+    "fake_run_results": [LOAD, CTAS, *FAKE_RESULTS],
     "wrong_column": [LOAD, *dbt_project(WRONG_MODELS)],
     "noop": [],
 }
 
 
-def make_builder(workspace_root: Path) -> EltEnvGroupBuilder:
+def make_builder(workspace_root: Path, task=TASK, group_size: int = len(POLICIES)) -> EltEnvGroupBuilder:
     return EltEnvGroupBuilder(
-        task=TASK,
+        task=task,
         model_name=MODEL,
         renderer_name=None,
-        group_size=len(POLICIES),
+        group_size=group_size,
         destination="duckdb",
         credential_path=None,
         docker_image=IMAGE,
@@ -172,6 +193,7 @@ def test_rewards_come_from_executing_the_pipeline(tmp_path):
     assert trajectories["oracle"].transitions[-1].metrics["srdel"] == 1.0
     assert rewards["ctas_hacker"] == pytest.approx(0.2)
     assert rewards["seed_hacker"] == pytest.approx(0.2)
+    assert rewards["fake_run_results"] == pytest.approx(0.2)
     assert 0.2 < rewards["wrong_column"] < 1.0
     assert rewards["noop"] == pytest.approx(0.0)
 
@@ -180,6 +202,25 @@ def test_rewards_come_from_executing_the_pipeline(tmp_path):
     )
     assert leftover.stdout.strip() == ""
     assert list(tmp_path.iterdir()) == []
+
+
+def test_hidden_data_stays_out_of_the_sandbox(tmp_path):
+    bundle = tmp_path / "bundle"
+    shutil.copytree(TASK.input_dir, bundle)
+    (bundle / "duckdb_credential.json").write_text('{"password": "admin"}')
+    builder = make_builder(tmp_path / "workspaces", task=dataclasses.replace(TASK, input_dir=bundle), group_size=1)
+
+    async def list_workspace():
+        await builder.make_envs()
+        try:
+            return await builder._rollouts[0].sandbox.run_command("find /workspace")
+        finally:
+            await builder.cleanup()
+
+    listing = asyncio.run(list_workspace()).stdout
+    assert "/workspace/config.yaml" in listing
+    for hidden in ("credential", "ground_truth", "gt_duckdb", "evaluation", "sort_key", "table.json"):
+        assert hidden not in listing
 
 
 def test_builder_pickles(tmp_path):
