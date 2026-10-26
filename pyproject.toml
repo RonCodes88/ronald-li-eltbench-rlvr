@@ -2,6 +2,7 @@
 name = "eltbench-rl"
 version = "0.1.0"
 description = "RLVR environment for ELT-Bench on Tinker, built on tinker-cookbook"
+readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
     "tinker-cookbook==0.5.8",
