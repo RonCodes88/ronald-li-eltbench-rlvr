@@ -1,0 +1,11 @@
+flat_files:
+- format: csv
+  path: /workspace/data/customers.csv
+  table: customers
+- format: jsonl
+  path: /workspace/data/orders.jsonl
+  table: orders
+duckdb:
+  config:
+    path: /workspace/warehouse.duckdb
+    schema: shop

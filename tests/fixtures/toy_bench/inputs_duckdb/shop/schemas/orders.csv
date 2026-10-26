@@ -1,0 +1,6 @@
+column_name,column_description
+order_id,Unique identifier of the order
+customer_id,Identifier of the customer who placed the order
+order_date,Date the order was placed
+amount,Order amount in USD
+status,Order status: completed or cancelled

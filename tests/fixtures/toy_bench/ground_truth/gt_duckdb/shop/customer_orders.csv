@@ -1,0 +1,7 @@
+customer_id,name,num_orders,total_amount,first_order_date
+1,Alice,3,77.6,2024-03-01
+2,Bob,2,73.3,2024-03-03
+3,Chen,3,30.740000000000002,2024-03-03
+4,Dana,0,0.0,
+5,Eve,1,18.0,2024-03-05
+6,Farid,0,0.0,

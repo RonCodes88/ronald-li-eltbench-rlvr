@@ -1,0 +1,23 @@
+models:
+  - name: customer_orders
+    description: Each record represents a customer, with a summary of their orders that were not cancelled.
+    columns:
+      - name: customer_id
+        description: Unique identifier of the customer.
+      - name: name
+        description: Name of the customer.
+      - name: num_orders
+        description: Number of orders that were not cancelled, replace NULL values with 0.
+      - name: total_amount
+        description: Total amount of the orders that were not cancelled, replace NULL values with 0.
+      - name: first_order_date
+        description: Date of the first order that was not cancelled, NULL if there is none.
+  - name: daily_revenue
+    description: Each record represents a day on which at least one order that was not cancelled was placed.
+    columns:
+      - name: order_date
+        description: The day.
+      - name: num_orders
+        description: Number of orders placed that day that were not cancelled.
+      - name: revenue
+        description: Total amount of the orders placed that day that were not cancelled.

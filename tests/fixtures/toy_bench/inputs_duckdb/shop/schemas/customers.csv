@@ -1,0 +1,5 @@
+column_name,column_description
+customer_id,Unique identifier of the customer
+name,Name of the customer
+country,Two-letter country code of the customer
+signup_date,Date the customer signed up
