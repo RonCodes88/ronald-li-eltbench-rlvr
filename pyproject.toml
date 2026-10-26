@@ -1,0 +1,24 @@
+[project]
+name = "eltbench-rl"
+version = "0.1.0"
+description = "RLVR environment for ELT-Bench on Tinker, built on tinker-cookbook"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "tinker-cookbook==0.5.8",
+    "pandas",
+    "pyyaml",
+    "huggingface_hub",
+    "snowflake-connector-python",
+    # Must match the duckdb version in docker/Dockerfile: the host reads files the sandbox writes.
+    "duckdb==1.5.6",
+]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["eltbench_rl"]
