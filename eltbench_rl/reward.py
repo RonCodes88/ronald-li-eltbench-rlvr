@@ -2,19 +2,89 @@
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import io
+import json
+import logging
 import re
-from pathlib import Path
+import time
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 
 import pandas as pd
 from db_connectors import BaseConnector
 from eva_stage2 import check_corretness, sort_by_keys
+from tinker_cookbook.renderers.base import Message
+from tinker_cookbook.sandbox import SandboxInterface
 
+from eltbench_rl.destinations import Destination
 from eltbench_rl.tasks import EltTask
+
+logger = logging.getLogger(__name__)
 
 EL_WEIGHT, BUILT_WEIGHT, COLUMN_WEIGHT = 0.2, 0.1, 0.7
 AIRBYTE_COLUMN = "_airbyte_raw_id"
+
+
+@dataclass
+class EltReward:
+    """Grade a finished rollout: re-run the submitted dbt project, then `grade` the warehouse.
+
+    Same shape as the cookbook's HarborReward: called once at episode end, before the sandbox goes away.
+    """
+
+    task: EltTask
+    destination: Destination
+    sandbox: SandboxInterface
+    workspace: Path  # host directory mounted at /workspace
+    namespace: str
+    dbt_timeout: int = 900
+
+    async def __call__(self, history: list[Message]) -> tuple[float, dict[str, float]]:
+        start = time.monotonic()
+        try:
+            built_models, has_seeds, dbt_ok = await self._rerun_dbt()
+            connector = self.destination.connector(self.workspace)
+            try:
+                reward, metrics = await asyncio.to_thread(
+                    grade, self.task, connector, self.namespace, built_models, has_seeds
+                )
+            finally:
+                connector.close()
+        except Exception as e:
+            logger.error("ELT-Bench grading failed for %s: %s", self.namespace, e)
+            return 0.0, {"grading_error": 1.0}
+        metrics["dbt_rerun_ok"] = float(dbt_ok)
+        metrics["time/grade_s"] = time.monotonic() - start
+        return reward, metrics
+
+    async def _rerun_dbt(self) -> tuple[set[str], bool, bool]:
+        """Run the agent's dbt project again from its final state; return (built models, has seeds, ok)."""
+        found = await self.sandbox.run_command(
+            "find /workspace/elt -name dbt_project.yml -not -path '*/dbt_packages/*'"
+        )
+        if not found.stdout.strip():
+            return set(), False, False
+        project = PurePosixPath(found.stdout.split()[0]).parent
+        # Delete any run_results.json the agent left, so only our own run is trusted.
+        result = await self.sandbox.run_command(
+            f"cd {project} && rm -f target/run_results.json && dbt run", timeout=self.dbt_timeout
+        )
+
+        host_project = self.workspace / project.relative_to("/workspace")
+        run_results = host_project / "target" / "run_results.json"
+        built = set()
+        if run_results.exists():
+            for node in json.loads(run_results.read_text())["results"]:
+                if node["unique_id"].startswith("model.") and node["status"] == "success":
+                    built.add(node["unique_id"].split(".", 2)[2].lower())
+        # Seed files would let the agent hardcode results instead of computing them from the sources.
+        has_seeds = any(
+            "target" not in path.parts and "dbt_packages" not in path.parts
+            for path in host_project.rglob("*.csv")
+        )
+        return built, has_seeds, result.exit_code == 0
 
 
 def grade(
