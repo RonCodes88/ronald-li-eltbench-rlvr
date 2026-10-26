@@ -22,3 +22,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["eltbench_rl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
