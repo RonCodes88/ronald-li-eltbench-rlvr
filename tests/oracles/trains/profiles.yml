@@ -1,0 +1,13 @@
+trains:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: "$account"
+      user: "$sf_username"
+      password: "$sf_password"
+      role: "$role"
+      database: "$database"
+      warehouse: "$warehouse"
+      schema: "$schema"
+      threads: 1

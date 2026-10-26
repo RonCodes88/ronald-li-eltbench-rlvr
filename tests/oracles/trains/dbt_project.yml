@@ -1,0 +1,6 @@
+name: trains_dbt
+version: "1.0"
+profile: trains
+models:
+  trains_dbt:
+    +materialized: table
