@@ -26,7 +26,7 @@ class CLIConfig:
     lora_rank: int = 32
     renderer_name: str | None = None
     load_checkpoint_path: str | None = None
-    max_tokens: int = 4096
+    max_tokens: int = 8192
     temperature: float = 1.0
 
     # Environment configuration

@@ -128,6 +128,9 @@ class EltEnvGroupBuilder(EnvGroupBuilder):
             max_trajectory_tokens=self.max_trajectory_tokens,
             max_generation_tokens=self.max_generation_tokens,
             context_overflow_reward=self.context_overflow_reward,
+            # A long planning message shouldn't throw away the pipeline built so far: keep the
+            # cut-off turn and continue; the trajectory token budget still bounds the episode.
+            terminate_on_length=False,
         )
 
     async def cleanup(self) -> None:

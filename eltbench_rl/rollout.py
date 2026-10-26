@@ -33,7 +33,7 @@ class RolloutCLIConfig:
     renderer_name: str | None = None
     checkpoint_url: str | None = None
     base_url: str | None = None
-    max_tokens: int = 4096
+    max_tokens: int = 8192
     temperature: float = 1.0
     max_turns: int = 100
     command_timeout: int = 600
