@@ -1,0 +1,6 @@
+# Local Airbyte for ELT-Bench: `abctl local install --port 8001 --values docker/airbyte-values.yaml`.
+# Airbyte 2.x no longer accepts username/password on its public API, which ELT-Bench's Terraform
+# provider (0.6.5) and job scripts use. This instance only listens on localhost, so turn auth off.
+global:
+  auth:
+    enabled: false
