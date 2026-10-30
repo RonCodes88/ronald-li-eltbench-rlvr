@@ -2,8 +2,8 @@
 
 A destination says which config.yaml field holds the per-rollout namespace, how to create and drop
 that namespace, and which ELT-Bench connector reads it back for grading. A snapshot is a saved copy
-of a verified extract/load, so transform-only rollouts can start from loaded sources without
-re-running Airbyte. Supporting another warehouse means adding one class here; the environment
+of loaded source tables: grading rebuilds the namespace from one, and transform-only rollouts start
+from a task's snapshot without re-running Airbyte. Supporting another warehouse means adding one class here; the environment
 itself does not change.
 """
 
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import time
 from pathlib import Path
 from typing import Protocol
 
@@ -25,15 +26,25 @@ class Destination(Protocol):
 
     def connector(self, workspace: Path) -> BaseConnector: ...
 
-    def create_namespace(self, namespace: str, workspace: Path, snapshot: str | None = None) -> dict[str, str]:
-        """Create the rollout's namespace (cloned from `snapshot` if given); return its config.yaml values."""
+    def create_namespace(self, namespace: str, workspace: Path) -> dict[str, str]:
+        """Create the rollout's (empty) namespace; return its config.yaml values."""
 
-    def drop_namespace(self, namespace: str) -> None: ...
-
-    def reset_namespace(self, namespace: str, workspace: Path, tables: list[str], snapshot: str | None = None) -> None:
-        """Rebuild the namespace with only `tables`, copied from `snapshot` or else from the namespace itself."""
+    def drop_namespace(self, namespace: str) -> None:
+        """Drop the namespace, along with its `rollout_snapshot`."""
 
     def save_snapshot(self, namespace: str, workspace: Path, snapshot: str, tables: list[str]) -> None: ...
+
+    def has_snapshot(self, snapshot: str) -> bool: ...
+
+    def reset_namespace(
+        self, namespace: str, workspace: Path, snapshot: str, tables: list[str], empty: bool = False
+    ) -> None:
+        """Rebuild the namespace with only `tables`, copied from `snapshot` (just their columns if `empty`)."""
+
+
+def rollout_snapshot(namespace: str) -> str:
+    """Where grading keeps a rollout's loaded sources while it rebuilds the namespace."""
+    return f"{namespace}__sources"
 
 
 class DuckDBConnector(BaseConnector):
@@ -71,24 +82,19 @@ class DuckDBDestination:
     def connector(self, workspace: Path) -> BaseConnector:
         return DuckDBConnector({"path": str(workspace / "warehouse.duckdb")})
 
-    def create_namespace(self, namespace: str, workspace: Path, snapshot: str | None = None) -> dict[str, str]:
-        # Every rollout has its own database file, which the agent creates unless we start from a snapshot.
-        if snapshot:
-            _copy_duckdb_tables(self.snapshot_dir / f"{snapshot}.duckdb", "main", workspace / "warehouse.duckdb", namespace)
+    def create_namespace(self, namespace: str, workspace: Path) -> dict[str, str]:
+        # Every rollout has its own database file, which the agent creates.
         return {"schema": namespace}
 
     def drop_namespace(self, namespace: str) -> None:
-        pass
+        (self.snapshot_dir / f"{rollout_snapshot(namespace)}.duckdb").unlink(missing_ok=True)
 
-    def reset_namespace(self, namespace: str, workspace: Path, tables: list[str], snapshot: str | None = None) -> None:
+    def reset_namespace(
+        self, namespace: str, workspace: Path, snapshot: str, tables: list[str], empty: bool = False
+    ) -> None:
         path = workspace / "warehouse.duckdb"
-        if snapshot:
-            path.unlink()
-            _copy_duckdb_tables(self.snapshot_dir / f"{snapshot}.duckdb", "main", path, namespace, tables)
-        else:
-            old = path.rename(workspace / "warehouse.old.duckdb")
-            _copy_duckdb_tables(old, namespace, path, namespace, tables)
-            old.unlink()
+        path.unlink(missing_ok=True)
+        _copy_duckdb_tables(self.snapshot_dir / f"{snapshot}.duckdb", "main", path, namespace, tables, empty)
 
     def save_snapshot(self, namespace: str, workspace: Path, snapshot: str, tables: list[str]) -> None:
         path = self.snapshot_dir / f"{snapshot}.duckdb"
@@ -96,9 +102,17 @@ class DuckDBDestination:
         path.unlink(missing_ok=True)
         _copy_duckdb_tables(workspace / "warehouse.duckdb", namespace, path, "main", tables)
 
+    def has_snapshot(self, snapshot: str) -> bool:
+        return (self.snapshot_dir / f"{snapshot}.duckdb").exists()
+
 
 def _copy_duckdb_tables(
-    source: Path, source_schema: str, target: Path, target_schema: str, tables: list[str] | None = None
+    source: Path,
+    source_schema: str,
+    target: Path,
+    target_schema: str,
+    tables: list[str] | None = None,
+    empty: bool = False,
 ) -> None:
     """Copy `tables` (default: all of them) from a schema of one DuckDB file into a schema of another."""
     con = duckdb.connect(str(target))
@@ -109,7 +123,10 @@ def _copy_duckdb_tables(
             query = f"SELECT table_name FROM duckdb_tables() WHERE database_name = 'source' AND schema_name = '{source_schema}'"
             tables = [table for (table,) in con.execute(query).fetchall()]
         for table in tables:
-            con.execute(f'CREATE TABLE "{target_schema}"."{table}" AS FROM source."{source_schema}"."{table}"')
+            con.execute(
+                f'CREATE TABLE "{target_schema}"."{table}" AS FROM source."{source_schema}"."{table}"'
+                + (" LIMIT 0" if empty else "")
+            )
     finally:
         con.close()
 
@@ -129,7 +146,7 @@ class SnowflakeDestination:
     def connector(self, workspace: Path | None = None) -> BaseConnector:
         return SnowflakeConnector(json.loads(Path(self.credential_path).read_text()))
 
-    def create_namespace(self, namespace: str, workspace: Path, snapshot: str | None = None) -> dict[str, str]:
+    def create_namespace(self, namespace: str, workspace: Path) -> dict[str, str]:
         # Each rollout gets its own role and user that own only this database, so rollouts can't read
         # or change each other's tables (ELT-Bench shares one AIRBYTE_ROLE between all tasks).
         role, user, password = f"{namespace}_ROLE", f"{namespace}_USER", secrets.token_urlsafe(24)
@@ -141,8 +158,7 @@ class SnowflakeDestination:
             f"GRANT ROLE {role} TO ROLE SYSADMIN",  # so the admin connection can grade and clean up
             "USE ROLE SYSADMIN",
             f"GRANT USAGE ON WAREHOUSE {WAREHOUSE} TO ROLE {role}",
-            # A snapshot clone is zero-copy: instant, and independent of the snapshot afterwards.
-            f"CREATE OR REPLACE DATABASE {namespace}" + (f" CLONE {snapshot}" if snapshot else ""),
+            f"CREATE OR REPLACE DATABASE {namespace}",
             *self._hand_over(namespace),
         )
         return {"database": namespace, "username": user, "password": password, "role": role}
@@ -150,31 +166,38 @@ class SnowflakeDestination:
     def drop_namespace(self, namespace: str) -> None:
         self._execute(
             f"DROP DATABASE IF EXISTS {namespace}",
+            f"DROP DATABASE IF EXISTS {rollout_snapshot(namespace)}",
             "USE ROLE SECURITYADMIN",
             f"DROP USER IF EXISTS {namespace}_USER",
             f"DROP ROLE IF EXISTS {namespace}_ROLE",
         )
 
-    def reset_namespace(self, namespace: str, workspace: Path, tables: list[str], snapshot: str | None = None) -> None:
-        source = snapshot or f"{namespace}__OLD"
-        self._execute(
-            *([] if snapshot else [f"ALTER DATABASE {namespace} RENAME TO {source}"]),
-            *self._copy_tables(source, namespace, tables),
-            *self._hand_over(namespace),
-            *([] if snapshot else [f"DROP DATABASE {source}"]),
-        )
-
     def save_snapshot(self, namespace: str, workspace: Path, snapshot: str, tables: list[str]) -> None:
-        # Copy only the source tables, so a snapshot never carries a previous rollout's dbt models.
+        # Copy only the source tables, so a snapshot never carries a rollout's dbt models.
         # The admin role owns it, so rollouts can't read or change it.
         self._execute(*self._copy_tables(namespace, snapshot, tables))
 
+    def has_snapshot(self, snapshot: str) -> bool:
+        connector = self.connector()
+        try:
+            return not connector.query(f"SHOW DATABASES LIKE '{snapshot}'").empty
+        finally:
+            connector.close()
+
+    def reset_namespace(
+        self, namespace: str, workspace: Path, snapshot: str, tables: list[str], empty: bool = False
+    ) -> None:
+        self._execute(*self._copy_tables(snapshot, namespace, tables, empty), *self._hand_over(namespace))
+
     @staticmethod
-    def _copy_tables(source: str, target: str, tables: list[str]) -> list[str]:
+    def _copy_tables(source: str, target: str, tables: list[str], empty: bool = False) -> list[str | list[str]]:
+        # CLONE is zero-copy; LIKE copies only the columns. Cloning tables one by one, all at once,
+        # is faster than cloning the whole database (about 3 s against 5 s for `trains`).
+        how = "LIKE" if empty else "CLONE"
         return [
             f"CREATE OR REPLACE DATABASE {target}",
             f"CREATE SCHEMA {target}.AIRBYTE_SCHEMA",
-            *[f"CREATE TABLE {target}.AIRBYTE_SCHEMA.{t} CLONE {source}.AIRBYTE_SCHEMA.{t}" for t in tables],
+            [f"CREATE TABLE {target}.AIRBYTE_SCHEMA.{t} {how} {source}.AIRBYTE_SCHEMA.{t}" for t in tables],
         ]
 
     @staticmethod
@@ -187,12 +210,19 @@ class SnowflakeDestination:
             f"GRANT OWNERSHIP ON ALL TABLES IN DATABASE {namespace} TO ROLE {role} COPY CURRENT GRANTS",
         ]
 
-    def _execute(self, *statements: str) -> None:
+    def _execute(self, *steps: str | list[str]) -> None:
+        """Run statements in order; the statements of a list run at the same time (as async queries)."""
         connector = self.connector()
         try:
-            cursor = connector.conn().cursor()
-            for statement in statements:
-                cursor.execute(statement)
+            conn = connector.conn()
+            for step in steps:
+                if isinstance(step, str):
+                    conn.cursor().execute(step)
+                    continue
+                query_ids = [conn.cursor().execute_async(statement)["queryId"] for statement in step]
+                for query_id in query_ids:
+                    while conn.is_still_running(conn.get_query_status_throw_if_error(query_id)):
+                        time.sleep(0.05)
         finally:
             connector.close()
 

@@ -8,17 +8,17 @@ saves the snapshot of loaded sources that transform-stage training starts from.
 
 import asyncio
 import json
+import urllib.error
 import urllib.request
 from pathlib import Path
 
 import pytest
-import yaml
 from test_local_integration import IMAGE, MODEL, ScriptedPolicy, image_available
 from tinker_cookbook import model_info, tokenizer_utils
 from tinker_cookbook.renderers import get_renderer
 from tinker_cookbook.rl.rollouts import do_single_rollout
 
-from eltbench_rl import ELT_BENCH_DIR
+from eltbench_rl import ELT_BENCH_DIR, airbyte
 from eltbench_rl.destinations import get_destination
 from eltbench_rl.docker_sandbox import DockerSandbox
 from eltbench_rl.env import PROXY_ENV, SANDBOX_NETWORK, EltEnvGroupBuilder
@@ -74,7 +74,7 @@ PY"""
 WAIT_FOR_SYNCS = """python - <<'PY'
 import subprocess, yaml
 airbyte = yaml.safe_load(open('/workspace/config.yaml'))['Airbyte']['config']
-subprocess.run(['python', '/workspace/check_job_status.py', '--server', 'airbyte-abctl-control-plane:80',
+subprocess.run(['python', '/workspace/check_job_status.py', '--server', airbyte['server_url'].split('/')[2],
                 '--username', airbyte['username'], '--password', airbyte['password']], check=True)
 PY"""
 
@@ -87,11 +87,13 @@ ORACLE_COMMANDS = [
 ]
 
 
-def count_airbyte_connections() -> int:
-    airbyte = yaml.safe_load(CONFIG.read_text())["Airbyte"]["config"]
-    url = f"http://localhost:8001/api/public/v1/connections?workspaceIds={airbyte['workspace_id']}"
-    with urllib.request.urlopen(url) as response:
-        return len(json.load(response)["data"])
+def airbyte_workspace_exists(workspace_id: str) -> bool:
+    try:
+        urllib.request.urlopen(f"{airbyte.API_URL}/workspaces/{workspace_id}")
+        return True
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
+        return False
 
 
 def make_builder(tmp_path, **kwargs) -> EltEnvGroupBuilder:
@@ -116,13 +118,13 @@ def run_oracle(builder: EltEnvGroupBuilder, commands: list[str]):
     renderer = get_renderer(model_info.get_recommended_renderer_name(MODEL), tokenizer_utils.get_tokenizer(MODEL))
 
     async def run():
-        [env] = await builder.make_envs()
-        namespace = builder._rollouts[0].namespace
         try:
+            [env] = await builder.make_envs()
+            rollout = builder._rollouts[0]
             trajectory = await do_single_rollout(ScriptedPolicy(renderer, commands), env)
         finally:
             await builder.cleanup()
-        return trajectory, namespace
+        return trajectory, rollout
 
     return asyncio.run(run())
 
@@ -139,11 +141,13 @@ def database_exists(name: str) -> bool:
     return not snowflake_query(f"show databases like '{name}'").empty
 
 
-def test_sandbox_reaches_only_snowflake_and_airbyte(tmp_path):
+def test_sandbox_reaches_only_snowflake_and_the_airbyte_gate(tmp_path):
     account = json.loads(CREDENTIAL.read_text())["account"]
     urls = {
         f"https://{account}.snowflakecomputing.com": True,
-        "http://airbyte-abctl-control-plane:80/api/public/v1/health": True,
+        "http://airbyte-gate:80/api/public/v1/health": True,
+        # Airbyte itself, which has no auth; the proxy refuses it too.
+        "--noproxy '*' http://airbyte-abctl-control-plane:80/api/public/v1/health": False,
         "https://huggingface.co/datasets/tttjjj/elt_bench": False,  # the public ground truth
         "https://github.com": False,
         "https://pypi.org": False,
@@ -167,9 +171,53 @@ def test_sandbox_reaches_only_snowflake_and_airbyte(tmp_path):
     assert codes["--noproxy '*' https://huggingface.co"] == "000"
 
 
+GATE_REQUESTS = """python - <<'PY'
+import json, requests
+for name, (login, method, path, body) in json.load(open("/workspace/requests.json")).items():
+    response = requests.request(method, login["server_url"] + path, json=body, auth=(login["username"], login["password"]))
+    print(json.dumps([name, response.status_code]))
+PY"""
+
+
+def test_airbyte_gate_keeps_rollouts_in_their_own_workspace(tmp_path):
+    mine, other = airbyte.create_workspace("gate_test_mine"), airbyte.create_workspace("gate_test_other")
+    requests = {
+        "own workspace": (mine, "GET", f"workspaces/{mine['workspace_id']}", None),
+        "other workspace": (mine, "GET", f"workspaces/{other['workspace_id']}", None),
+        "list all workspaces": (mine, "GET", "workspaces", None),
+        "source in other workspace": (mine, "POST", "sources", {"workspaceId": other["workspace_id"], "name": "x"}),
+        "wrong password": ({**mine, "password": "guess"}, "GET", f"workspaces/{mine['workspace_id']}", None),
+        "Airbyte's internal API": (mine, "POST", "../../v1/workspaces/list", {}),
+    }
+    (tmp_path / "requests.json").write_text(json.dumps(requests))
+
+    async def check():
+        sandbox = await DockerSandbox.create(IMAGE, tmp_path, SANDBOX_NETWORK, PROXY_ENV)
+        try:
+            return await sandbox.run_command(GATE_REQUESTS, timeout=60)
+        finally:
+            await sandbox.cleanup()
+
+    try:
+        result = asyncio.run(check())
+    finally:
+        airbyte.delete_workspace(mine["workspace_id"])
+        airbyte.delete_workspace(other["workspace_id"])
+    print(result.stdout, result.stderr)
+    codes = dict(json.loads(line) for line in result.stdout.splitlines())
+    assert codes == {
+        "own workspace": 200,
+        "other workspace": 403,
+        "list all workspaces": 403,
+        "source in other workspace": 403,
+        "wrong password": 401,
+        "Airbyte's internal API": 403,
+    }
+
+
 def test_oracle_pipeline_scores_one(tmp_path):
-    connections_before = count_airbyte_connections()
-    trajectory, namespace = run_oracle(make_builder(tmp_path, save_snapshot=True), ORACLE_COMMANDS)
+    trajectory, rollout = run_oracle(make_builder(tmp_path, save_snapshot=True), ORACLE_COMMANDS)
+    namespace = rollout.namespace
     metrics = trajectory.transitions[-1].metrics
     print(namespace, metrics)
 
@@ -180,7 +228,9 @@ def test_oracle_pipeline_scores_one(tmp_path):
     assert not database_exists(namespace)
     assert snowflake_query(f"show users like '{namespace}_USER'").empty  # per-rollout user and role are gone
     assert snowflake_query(f"show roles like '{namespace}_ROLE'").empty
-    assert count_airbyte_connections() == connections_before
+    assert not database_exists(f"{namespace}__sources")
+    assert not airbyte_workspace_exists(rollout.airbyte_workspace)
+    assert metrics["hardcoded_frac"] == 0.0
     assert database_exists("trains__snapshot")
 
 

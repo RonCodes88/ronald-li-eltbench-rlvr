@@ -5,7 +5,7 @@ import duckdb
 import pytest
 
 from eltbench_rl.destinations import DuckDBDestination
-from eltbench_rl.reward import grade, rewrite_namespace
+from eltbench_rl.reward import grade, model_outputs, rewrite_namespace
 from eltbench_rl.tasks import load_tasks
 
 TOY_BENCH = Path(__file__).parent / "fixtures" / "toy_bench"
@@ -89,6 +89,13 @@ def test_airbyte_tasks_require_airbyte_columns(tmp_path):
     assert metrics["srdel"] == 1.0
 
 
+def test_source_tables_need_exactly_their_schema_columns(tmp_path):
+    build_warehouse(tmp_path, after_load="alter table {{ target.schema }}.orders add column answer varchar;")
+    _, metrics = run_grade(tmp_path)
+
+    assert metrics["el_frac"] == 0.5 and metrics["srdel"] == 0.0
+
+
 def test_tables_airbyte_did_not_sync_fail_stage_one(tmp_path):
     build_warehouse(tmp_path)
     _, metrics = run_grade(tmp_path, airbyte_tables={"customers", "orders"})
@@ -96,6 +103,21 @@ def test_tables_airbyte_did_not_sync_fail_stage_one(tmp_path):
 
     _, metrics = run_grade(tmp_path, airbyte_tables={"customers"})
     assert metrics["el_frac"] == 0.5 and metrics["srdel"] == 0.0
+
+
+def test_tables_that_ignore_their_sources_count_as_hardcoded(tmp_path):
+    build_warehouse(tmp_path)
+    connector = DuckDBDestination().connector(tmp_path)
+    outputs = model_outputs(TASK, connector, NAMESPACE, MODELS)
+
+    # As if the run on empty sources had returned exactly these rows too.
+    reward, metrics = grade(TASK, connector, NAMESPACE, MODELS, False, empty_outputs=outputs)
+    assert reward == pytest.approx(0.2)
+    assert metrics["hardcoded_frac"] == 1.0 and metrics["built_frac"] == 0.0
+
+    no_rows = {name: df.iloc[:0] for name, df in outputs.items()}
+    reward, metrics = grade(TASK, connector, NAMESPACE, MODELS, False, empty_outputs=no_rows)
+    assert reward == pytest.approx(1.0) and metrics["hardcoded_frac"] == 0.0
 
 
 def test_empty_warehouse_scores_zero(tmp_path):

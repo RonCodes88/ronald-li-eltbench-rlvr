@@ -39,7 +39,7 @@ class RolloutCLIConfig:
     command_timeout: int = 600
     max_trajectory_tokens: int = 64 * 1024
     stage: str = "full"  # "transform": dbt only, starting from a saved snapshot
-    save_snapshot: bool = False  # save the loaded sources if this rollout passes stage 1
+    save_snapshot: bool = False  # make this rollout's load the task's reference snapshot, if it passes stage 1
     docker_image: str = "eltbench-rl"
     docker_network: str | None = None
     output_dir: str = cli_utils.runs_path("eltbench_rollouts")

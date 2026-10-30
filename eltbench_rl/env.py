@@ -1,11 +1,13 @@
 """ELT-Bench as a tinker-cookbook RL environment.
 
 Follows tinker_cookbook/recipes/harbor_rl/harbor_env.py: one bash tool in a sandbox per rollout and a
-reward computed by execution when the episode ends. Each rollout also gets its own warehouse
-namespace, because the warehouse and Airbyte are shared between rollouts.
+reward computed by execution when the episode ends. The warehouse and Airbyte are shared between
+rollouts, so each rollout gets its own warehouse namespace (with its own credentials) and its own
+Airbyte workspace.
 
-With stage="transform", rollouts skip extract/load: their namespace is cloned from a snapshot of a
-verified load (saved by a full rollout with save_snapshot=True), and the prompt is stage 2 only.
+With stage="transform", rollouts skip extract/load: their namespace is cloned from the task's
+reference load of its sources (a snapshot saved by a trusted full run with save_snapshot=True, like
+the oracle test), and the prompt is stage 2 only.
 """
 
 from __future__ import annotations
@@ -29,7 +31,8 @@ from tinker_cookbook.rl.rollout_presets import RolloutConfig
 from tinker_cookbook.rl.types import Env, EnvGroupBuilder, RLDataset, RLDatasetBuilder
 from tinker_cookbook.tool_use import build_agent_tool_env
 
-from eltbench_rl.destinations import Destination, get_destination
+from eltbench_rl import airbyte
+from eltbench_rl.destinations import get_destination
 from eltbench_rl.docker_sandbox import DockerSandbox
 from eltbench_rl.reward import EltReward
 from eltbench_rl.tasks import EltTask, load_tasks, transform_instruction
@@ -43,12 +46,12 @@ SYSTEM_PROMPT = (
     "When the pipeline is complete, reply without calling a tool: that submits it for grading."
 )
 # Internal Docker network for Snowflake runs (docker/sandbox-network.sh): its only ways out are the
-# Airbyte control plane and a proxy that lets HTTPS through to Snowflake and nothing else.
+# Airbyte gate and a proxy that lets HTTPS through to Snowflake and nothing else.
 SANDBOX_NETWORK = "eltbench-sandbox"
 PROXY = "http://eltbench-proxy:8888"
 PROXY_ENV = {
     name: value
-    for names, value in [(("HTTPS_PROXY", "HTTP_PROXY"), PROXY), (("NO_PROXY",), "airbyte-abctl-control-plane,localhost")]
+    for names, value in [(("HTTPS_PROXY", "HTTP_PROXY"), PROXY), (("NO_PROXY",), "airbyte-gate,localhost")]
     for name in (*names, *(n.lower() for n in names))
 }
 
@@ -58,11 +61,12 @@ class _Rollout:
     sandbox: DockerSandbox
     namespace: str
     workspace: Path
+    airbyte_workspace: str | None = None
 
 
-def _update_config(config_path: Path, destination: Destination, values: dict[str, str]) -> None:
+def _update_config(config_path: Path, block: str, values: dict[str, str]) -> None:
     config = yaml.safe_load(config_path.read_text())
-    config[destination.name]["config"].update(values)
+    config[block]["config"].update(values)
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
 
 
@@ -114,9 +118,13 @@ class EltEnvGroupBuilder(EnvGroupBuilder):
         tokenizer = tokenizer_utils.get_tokenizer(self.model_name)
         renderer_name = self.renderer_name or model_info.get_recommended_renderer_name(self.model_name)
         renderer = get_renderer(renderer_name, tokenizer)
-        return await asyncio.gather(*[self._make_env(renderer) for _ in range(self.group_size)])
+        # Grade from the task's reference load when there is one (or this group is making it).
+        destination = get_destination(self.destination, self.credential_path)
+        has_reference = self.save_snapshot or await asyncio.to_thread(destination.has_snapshot, self.snapshot)
+        reference = self.snapshot if has_reference else None
+        return await asyncio.gather(*[self._make_env(renderer, reference) for _ in range(self.group_size)])
 
-    async def _make_env(self, renderer: Renderer) -> Env:
+    async def _make_env(self, renderer: Renderer, reference: str | None) -> Env:
         destination = get_destination(self.destination, self.credential_path)
         namespace = f"{self.task.name}__{uuid.uuid4().hex[:8]}"
         workspace = Path(self.workspace_root) / namespace
@@ -125,11 +133,19 @@ class EltEnvGroupBuilder(EnvGroupBuilder):
 
         env = PROXY_ENV if self.docker_network == SANDBOX_NETWORK else {}
         sandbox = await DockerSandbox.create(self.docker_image, workspace, self.docker_network, env)
-        self._rollouts.append(_Rollout(sandbox, namespace, workspace))
-        from_snapshot = self.snapshot if self.stage == "transform" else None
-        # The namespace comes with its own credentials, which replace the shared ones in config.yaml.
-        values = await asyncio.to_thread(destination.create_namespace, namespace, workspace, from_snapshot)
-        _update_config(workspace / "config.yaml", destination, values)
+        rollout = _Rollout(sandbox, namespace, workspace)
+        self._rollouts.append(rollout)
+        # The namespace and Airbyte workspace come with their own credentials, which replace the
+        # shared ones in config.yaml.
+        values = await asyncio.to_thread(destination.create_namespace, namespace, workspace)
+        _update_config(workspace / "config.yaml", destination.name, values)
+        if self.stage == "transform":
+            tables = list(self.task.source_tables)
+            await asyncio.to_thread(destination.reset_namespace, namespace, workspace, self.snapshot, tables)
+        if self.task.uses_airbyte and self.stage == "full":
+            values = await asyncio.to_thread(airbyte.create_workspace, namespace)
+            rollout.airbyte_workspace = values["workspace_id"]
+            _update_config(workspace / "config.yaml", "Airbyte", values)
         instruction = self.task.instruction if self.stage == "full" else transform_instruction(self.task.instruction)
 
         bash_tool = HarborBashTool(sandbox, command_timeout=self.command_timeout)
@@ -142,9 +158,9 @@ class EltEnvGroupBuilder(EnvGroupBuilder):
             initial_messages=initial_messages,
             reward_fn=EltReward(
                 self.task, destination, sandbox, workspace, namespace,
-                check_airbyte_jobs=self.task.uses_airbyte and self.stage == "full",
-                restore_from=from_snapshot,
-                save_snapshot_as=self.snapshot if self.save_snapshot else None,
+                airbyte_workspace=rollout.airbyte_workspace,
+                snapshot=reference,
+                save_snapshot=self.save_snapshot,
             ),  # fmt: skip
             # Every command shares one container, so run them in order; retry malformed tool calls.
             rollout_config=RolloutConfig(
@@ -168,6 +184,8 @@ class EltEnvGroupBuilder(EnvGroupBuilder):
                     "if [ -f elt/terraform.tfstate ]; then cd elt && terraform destroy -auto-approve; fi",
                     timeout=600,
                 )
+                if rollout.airbyte_workspace:
+                    await asyncio.to_thread(airbyte.delete_workspace, rollout.airbyte_workspace)
                 # Files written in the container can be root-owned on Linux hosts.
                 await rollout.sandbox.run_command("rm -rf /workspace/* /workspace/.[!.]*", timeout=120)
                 await asyncio.to_thread(destination.drop_namespace, rollout.namespace)

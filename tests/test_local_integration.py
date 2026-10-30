@@ -13,6 +13,7 @@ import subprocess
 from pathlib import Path
 
 import duckdb
+import pandas as pd
 import pytest
 from tinker_cookbook import model_info, tokenizer_utils
 from tinker_cookbook.completers import StopCondition, TokenCompleter, TokensWithLogprobs
@@ -40,6 +41,13 @@ def image_available() -> bool:
 pytestmark = pytest.mark.skipif(
     not image_available(), reason=f"needs Docker and the {IMAGE} image: docker build -t {IMAGE} docker/"
 )
+
+
+@pytest.fixture(autouse=True)
+def snapshot_dir(tmp_path_factory, monkeypatch):
+    path = tmp_path_factory.mktemp("snapshots")
+    monkeypatch.setattr(DuckDBDestination, "snapshot_dir", path)
+    return path
 
 
 class ScriptedPolicy(TokenCompleter):
@@ -126,6 +134,9 @@ WRONG_MODELS = {
     "customer_orders": SOLUTION_MODELS["customer_orders"].replace(" and o.status <> 'cancelled'", ""),
 }
 LOAD = run_duckdb_sql((SOLUTION / "load.sql").read_text())
+# Fit the data to a wrong model instead of the model to the data: with cancelled orders moved to a
+# customer that doesn't exist, the model that forgets to filter them out gives the right answers.
+EDIT_SOURCES = run_duckdb_sql("update {{ target.schema }}.orders set customer_id = -1 where status = 'cancelled';")
 CTAS = run_duckdb_sql(
     "\n".join(f"create table {{{{ target.schema }}}}.{name} as {sql};" for name, sql in SOLUTION_MODELS.items())
 )
@@ -134,6 +145,19 @@ HELPER_TABLES = run_duckdb_sql(
     "\n".join(f"create table {{{{ target.schema }}}}.helper_{name} as {sql};" for name, sql in SOLUTION_MODELS.items())
 )
 HELPER_MODELS = {name: f"select * from {{{{ target.schema }}}}.helper_{name}" for name in SOLUTION_MODELS}
+
+
+def hardcoded_model(name: str) -> str:
+    """A model that returns the answer rows typed in as literals, without reading any source."""
+    answers = pd.read_csv(TASK.gt_dir / f"{name}.csv", dtype=str)
+    rows = ", ".join(
+        "(" + ", ".join("NULL" if pd.isna(value) else f"'{value}'" for value in row) + ")"
+        for row in answers.itertuples(index=False)
+    )
+    columns = ", ".join(f'"{column}"' for column in answers.columns)
+    return f"select * from (values {rows}) as answers({columns})"
+
+
 # Broken models that dbt cannot build, plus a forged run_results.json claiming they succeeded.
 FAKE_RUN_RESULTS = json.dumps(
     {"results": [{"unique_id": f"model.shop_dbt.{name}", "status": "success"} for name in SOLUTION_MODELS]}
@@ -149,6 +173,7 @@ POLICIES = {
     "seed_hacker": [LOAD, *seed_hack()],
     "fake_run_results": [LOAD, CTAS, *FAKE_RESULTS],
     "helper_table_hacker": [LOAD, HELPER_TABLES, *dbt_project(HELPER_MODELS)],
+    "hardcoded_values": [LOAD, *dbt_project({name: hardcoded_model(name) for name in SOLUTION_MODELS})],
     "wrong_column": [LOAD, *dbt_project(WRONG_MODELS)],
     "noop": [],
 }
@@ -209,6 +234,9 @@ def test_rewards_come_from_executing_the_pipeline(tmp_path):
     assert rewards["seed_hacker"] == pytest.approx(0.2)
     assert rewards["fake_run_results"] == pytest.approx(0.2)
     assert rewards["helper_table_hacker"] == pytest.approx(0.2)
+    assert rewards["hardcoded_values"] == pytest.approx(0.2)
+    assert trajectories["hardcoded_values"].transitions[-1].metrics["hardcoded_frac"] == 1.0
+    assert trajectories["oracle"].transitions[-1].metrics["hardcoded_frac"] == 0.0
     assert 0.2 < rewards["wrong_column"] < 1.0
     assert rewards["noop"] == pytest.approx(0.0)
 
@@ -218,11 +246,10 @@ def test_rewards_come_from_executing_the_pipeline(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
-def test_transform_stage_starts_from_a_snapshot(tmp_path, monkeypatch):
-    monkeypatch.setattr(DuckDBDestination, "snapshot_dir", tmp_path / "snapshots")
+def test_transform_stage_starts_from_a_snapshot(tmp_path, snapshot_dir):
     run_group(make_builder(tmp_path / "full", group_size=1, save_snapshot=True), {"oracle": POLICIES["oracle"]})
 
-    snapshot = duckdb.connect(str(tmp_path / "snapshots" / "shop__snapshot.duckdb"), read_only=True)
+    snapshot = duckdb.connect(str(snapshot_dir / "shop__snapshot.duckdb"), read_only=True)
     assert sorted(t for (t,) in snapshot.execute("SELECT table_name FROM duckdb_tables()").fetchall()) == [
         "customers",
         "orders",
@@ -237,6 +264,18 @@ def test_transform_stage_starts_from_a_snapshot(tmp_path, monkeypatch):
     assert rewards["dbt_only"] == pytest.approx(1.0)
     assert rewards["noop"] == pytest.approx(0.2)  # the cloned sources pass stage 1, nothing else does
     assert builder.docker_network == "none"
+
+
+def test_full_rollouts_are_graded_on_the_reference_load(tmp_path):
+    policies = {"edited_sources": [LOAD, EDIT_SOURCES, *dbt_project(WRONG_MODELS)]}
+
+    def reward(name: str) -> float:
+        trajectories = run_group(make_builder(tmp_path / name, group_size=1), policies)
+        return sum(t.reward for t in trajectories["edited_sources"].transitions)
+
+    assert reward("no_reference") == pytest.approx(1.0)  # without a reference load, the edit pays off
+    run_group(make_builder(tmp_path / "oracle", group_size=1, save_snapshot=True), {"oracle": POLICIES["oracle"]})
+    assert 0.2 < reward("with_reference") < 1.0  # graded on the real data: just the wrong model's score
 
 
 def test_hidden_data_stays_out_of_the_sandbox(tmp_path):
