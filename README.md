@@ -42,26 +42,26 @@ uv run python -m eltbench_rl.rollout task=trains destination=snowflake \
 uv run pytest tests/test_official_trains.py -s   # hand-written oracle on the same task: reward 1.0
 ```
 
-Official tasks need the 256K-context model variant, which samples at the same price. The rollout prints the reward breakdown and saves `result.json` and a transcript under `~/tinker-runs/eltbench_rollouts/`. On `trains`, the base Qwen3.6-35B-A3B completed the whole Airbyte stage on its own (SRDEL 1.0, reward 0.2) but ran out of turns before dbt.
+Official tasks need the 256K-context model variant: with a 64K budget, our first `trains` rollout ran out of tokens after 7 turns. The rollout prints the reward breakdown and saves `result.json` and a transcript under `~/tinker-runs/eltbench_rollouts/`. On `trains`, the base Qwen3.6-35B-A3B completed the whole Airbyte stage on its own (SRDEL 1.0, reward 0.2) but ran out of turns before dbt.
 
 **3. A Tinker RL optimization step with execution-derived rewards.** Needs `TINKER_API_KEY`.
 
 ```bash
 uv run python -m eltbench_rl.train bench_dir=tests/fixtures/toy_bench destination=duckdb tasks=shop \
     group_size=4 max_turns=20 max_steps=1
-# official task:
+# same on an official task (we have only run the toy step above):
 uv run python -m eltbench_rl.train tasks=trains destination=snowflake max_steps=1 \
     credential_path=third_party/ELT-Bench/setup/destination/snowflake_credential.json \
     model_name=Qwen/Qwen3.6-35B-A3B:peft:262144 max_trajectory_tokens=200000
 ```
 
-The toy step costs under $1. In our run the group's rewards were `[1.0, 1.0, 0.2, 1.0]`, which gives non-zero GRPO advantages. Metrics go to `metrics.jsonl` under the log path (`env/all/reward/total`, `env/all/srdel`, `env/all/srdt`, ...).
+In our run of the toy step the group's rewards were `[1.0, 1.0, 0.2, 1.0]`, which gives non-zero GRPO advantages. Metrics go to `metrics.jsonl` under the log path (`env/all/reward/total`, `env/all/srdel`, `env/all/srdt`, ...).
 
 ## Official setup (Snowflake + local Airbyte)
 
 This follows [ELT-Bench's README](third_party/ELT-Bench/README.md), with fixes for current Airbyte. Credential files live in the ELT-Bench submodule and are never committed.
 
-1. **Snowflake.** Use any account; trial accounts are exempt from Snowflake's password-auth phase-out.
+1. **Snowflake.** A trial account works.
    - Create an admin user with a password that has `SYSADMIN` and `SECURITYADMIN`.
    - Put it in `third_party/ELT-Bench/setup/destination/snowflake_credential.json` as `{"account", "user", "password", "role": "sysadmin", "warehouse": "AIRBYTE_WAREHOUSE"}`.
    - Run ELT-Bench's `setup/destination/setup.sql` as that user. It creates `AIRBYTE_ROLE`, `AIRBYTE_USER` and `AIRBYTE_WAREHOUSE`.
@@ -88,22 +88,15 @@ This follows [ELT-Bench's README](third_party/ELT-Bench/README.md), with fixes f
 
 ## How it works
 
-- **Episode.** `EltEnvGroupBuilder` gives each rollout:
-  - a copy of the task bundle, without admin credentials;
-  - its own warehouse namespace `<task>__<uuid8>`, written into `config.yaml`;
-  - its own container on ELT-Bench's Docker network (or `--network none` for local tasks).
+**Episode.** Each rollout gets a copy of the task bundle (without admin credentials), its own warehouse namespace `<task>__<uuid8>` written into `config.yaml`, and its own container. The container joins ELT-Bench's Docker network for Airbyte tasks and has no network for local ones. The model's only tool is the cookbook's `HarborBashTool`. The episode ends when the model replies without a tool call, which submits the pipeline, or when it hits 100 turns, the token budget, or too many malformed tool calls in a row. Cleanup runs `terraform destroy`, drops the namespace and removes the container.
 
-  The model uses the cookbook's `HarborBashTool`. The episode ends when the model replies without a tool call (submission), at 100 turns, at the token budget, or after repeated malformed tool calls. Cleanup runs `terraform destroy`, drops the namespace and removes the container.
-- **Reward.** `0.2·el_frac + 0.1·built_frac + 0.7·col_frac`:
-  - **Stage 1 (`el_frac`):** source tables with exact row counts that were loaded by Airbyte.
-  - **Process (`built_frac`):** models that our dbt re-run built.
-  - **Stage 2 (`col_frac`):** ground-truth columns matched by ELT-Bench's `check_corretness`. As in ELT-Bench, stage 2 counts only after stage 1 passes.
-  - We also log ELT-Bench's own metrics (SRDEL, SRDT).
-- **Anti-hacking.** Hidden data never enters the sandbox. Only tables our own dbt re-run builds are graded. Seeds and forged dbt artifacts are rejected. See DESIGN.md Step 4.
+**Reward.** `0.2·el_frac + 0.1·built_frac + 0.7·col_frac`, where `el_frac` is the share of source tables Airbyte loaded with the right row count, `built_frac` is the share of models our own dbt re-run built, and `col_frac` is the share of ground-truth columns that match, using ELT-Bench's `check_corretness`. As in ELT-Bench, the last two terms only count once every source table is loaded. ELT-Bench's own metrics (SRDEL, SRDT) are logged too.
+
+**Anti-hacking.** Hidden data never enters the sandbox, only tables built by our dbt re-run are graded, and seeds and forged dbt artifacts are rejected. DESIGN.md Step 4 lists what is still open.
 
 ## Adding a warehouse
 
-Implement the four-member `Destination` protocol in `eltbench_rl/destinations.py`: `name`, `namespace_field`, `connector()`, and `create_namespace()`/`drop_namespace()`. Usually this means wrapping the matching ELT-Bench connector (`DatabricksConnector` or `RedshiftConnector` from `evaluation/db_connectors.py`, with `namespace_field="schema"`). Register it in `get_destination`, then generate inputs with `write_config.py --destination <name>`. The environment itself doesn't change.
+Write a class with the `Destination` protocol from `eltbench_rl/destinations.py` (`name`, `namespace_field`, `connector()`, `create_namespace()`, `drop_namespace()`), register it in `get_destination`, and generate task inputs with ELT-Bench's `write_config.py --destination <name>`. ELT-Bench already has `DatabricksConnector` and `RedshiftConnector` in `evaluation/db_connectors.py` for grading. The environment code doesn't change. Only Snowflake and DuckDB are implemented and tested.
 
 ## Layout
 
