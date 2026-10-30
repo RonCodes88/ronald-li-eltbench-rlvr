@@ -38,6 +38,8 @@ class RolloutCLIConfig:
     max_turns: int = 100
     command_timeout: int = 600
     max_trajectory_tokens: int = 64 * 1024
+    stage: str = "full"  # "transform": dbt only, starting from a saved snapshot
+    save_snapshot: bool = False  # save the loaded sources if this rollout passes stage 1
     docker_image: str = "eltbench-rl"
     docker_network: str | None = None
     output_dir: str = cli_utils.runs_path("eltbench_rollouts")
@@ -72,6 +74,8 @@ async def run(config: RolloutCLIConfig) -> None:
         command_timeout=config.command_timeout,
         max_trajectory_tokens=config.max_trajectory_tokens,
         max_generation_tokens=config.max_tokens,
+        stage=config.stage,
+        save_snapshot=config.save_snapshot,
     )
     start = time.monotonic()
     try:

@@ -12,6 +12,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import duckdb
 import pytest
 from tinker_cookbook import model_info, tokenizer_utils
 from tinker_cookbook.completers import StopCondition, TokenCompleter, TokensWithLogprobs
@@ -19,6 +20,7 @@ from tinker_cookbook.renderers import get_renderer
 from tinker_cookbook.renderers.base import Message, Renderer, ToolCall
 from tinker_cookbook.rl.rollouts import do_single_rollout
 
+from eltbench_rl.destinations import DuckDBDestination
 from eltbench_rl.env import EltEnvGroupBuilder
 from eltbench_rl.tasks import load_tasks
 
@@ -146,7 +148,7 @@ POLICIES = {
 }
 
 
-def make_builder(workspace_root: Path, task=TASK, group_size: int = len(POLICIES)) -> EltEnvGroupBuilder:
+def make_builder(workspace_root: Path, task=TASK, group_size: int = len(POLICIES), **kwargs) -> EltEnvGroupBuilder:
     return EltEnvGroupBuilder(
         task=task,
         model_name=MODEL,
@@ -159,7 +161,24 @@ def make_builder(workspace_root: Path, task=TASK, group_size: int = len(POLICIES
         workspace_root=str(workspace_root),
         max_turns=10,
         command_timeout=300,
+        **kwargs,
     )
+
+
+def run_group(builder: EltEnvGroupBuilder, policies: dict[str, list[str]]) -> dict:
+    renderer = get_renderer(model_info.get_recommended_renderer_name(MODEL), tokenizer_utils.get_tokenizer(MODEL))
+
+    async def run():
+        envs = await builder.make_envs()
+        try:
+            trajectories = await asyncio.gather(
+                *[do_single_rollout(ScriptedPolicy(renderer, cmds), env) for cmds, env in zip(policies.values(), envs)]
+            )
+        finally:
+            await builder.cleanup()
+        return dict(zip(policies, trajectories))
+
+    return asyncio.run(run())
 
 
 def test_scripted_tool_calls_parse_back():
@@ -172,20 +191,7 @@ def test_scripted_tool_calls_parse_back():
 
 
 def test_rewards_come_from_executing_the_pipeline(tmp_path):
-    builder = make_builder(tmp_path)
-    renderer = get_renderer(model_info.get_recommended_renderer_name(MODEL), tokenizer_utils.get_tokenizer(MODEL))
-
-    async def run():
-        envs = await builder.make_envs()
-        try:
-            trajectories = await asyncio.gather(
-                *[do_single_rollout(ScriptedPolicy(renderer, cmds), env) for cmds, env in zip(POLICIES.values(), envs)]
-            )
-        finally:
-            await builder.cleanup()
-        return dict(zip(POLICIES, trajectories))
-
-    trajectories = asyncio.run(run())
+    trajectories = run_group(make_builder(tmp_path), POLICIES)
     rewards = {name: sum(t.reward for t in traj.transitions) for name, traj in trajectories.items()}
     print(rewards)
 
@@ -202,6 +208,27 @@ def test_rewards_come_from_executing_the_pipeline(tmp_path):
     )
     assert leftover.stdout.strip() == ""
     assert list(tmp_path.iterdir()) == []
+
+
+def test_transform_stage_starts_from_a_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setattr(DuckDBDestination, "snapshot_dir", tmp_path / "snapshots")
+    run_group(make_builder(tmp_path / "full", group_size=1, save_snapshot=True), {"oracle": POLICIES["oracle"]})
+
+    snapshot = duckdb.connect(str(tmp_path / "snapshots" / "shop__snapshot.duckdb"), read_only=True)
+    assert sorted(t for (t,) in snapshot.execute("SELECT table_name FROM duckdb_tables()").fetchall()) == [
+        "customers",
+        "orders",
+    ]  # only the sources, never the oracle's dbt models
+    snapshot.close()
+
+    policies = {"dbt_only": dbt_project(SOLUTION_MODELS), "noop": []}
+    builder = make_builder(tmp_path / "transform", group_size=len(policies), stage="transform")
+    trajectories = run_group(builder, policies)
+    rewards = {name: sum(t.reward for t in traj.transitions) for name, traj in trajectories.items()}
+
+    assert rewards["dbt_only"] == pytest.approx(1.0)
+    assert rewards["noop"] == pytest.approx(0.2)  # the cloned sources pass stage 1, nothing else does
+    assert builder.docker_network == "none"
 
 
 def test_hidden_data_stays_out_of_the_sandbox(tmp_path):

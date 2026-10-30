@@ -9,10 +9,12 @@ import json
 import logging
 import re
 import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 import pandas as pd
+import yaml
 from db_connectors import BaseConnector
 from eva_stage2 import check_corretness, sort_by_keys
 from tinker_cookbook.renderers.base import Message
@@ -25,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 EL_WEIGHT, BUILT_WEIGHT, COLUMN_WEIGHT = 0.2, 0.1, 0.7
 AIRBYTE_COLUMN = "_airbyte_raw_id"
+# Airbyte's public API as the host sees it (abctl local install --port 8001).
+AIRBYTE_API_URL = "http://localhost:8001/api/public/v1"
 
 
 @dataclass
@@ -39,19 +43,27 @@ class EltReward:
     sandbox: SandboxInterface
     workspace: Path  # host directory mounted at /workspace
     namespace: str
+    check_airbyte_jobs: bool  # False when the sources came from a snapshot instead of Airbyte
+    save_snapshot_as: str | None = None  # keep a copy of the sources once they pass stage 1
     dbt_timeout: int = 900
 
     async def __call__(self, history: list[Message]) -> tuple[float, dict[str, float]]:
         start = time.monotonic()
         try:
             built_models, has_seeds, dbt_ok = await self._rerun_dbt()
+            airbyte_tables = await asyncio.to_thread(self._airbyte_tables) if self.check_airbyte_jobs else None
             connector = self.destination.connector(self.workspace)
             try:
                 reward, metrics = await asyncio.to_thread(
-                    grade, self.task, connector, self.namespace, built_models, has_seeds
+                    grade, self.task, connector, self.namespace, built_models, has_seeds, airbyte_tables
                 )
             finally:
                 connector.close()
+            if self.save_snapshot_as and metrics["srdel"] == 1.0:
+                await asyncio.to_thread(
+                    self.destination.save_snapshot,
+                    self.namespace, self.workspace, self.save_snapshot_as, list(self.task.source_tables),
+                )  # fmt: skip
         except Exception as e:
             logger.error("ELT-Bench grading failed for %s: %s", self.namespace, e)
             return 0.0, {"grading_error": 1.0}
@@ -87,6 +99,31 @@ class EltReward:
         )
         return built, has_seeds, result.exit_code == 0
 
+    def _airbyte_tables(self) -> set[str]:
+        workspace_id = yaml.safe_load((self.workspace / "config.yaml").read_text())["Airbyte"]["config"]["workspace_id"]
+        return airbyte_synced_tables(workspace_id, self.destination.namespace_field, self.namespace)
+
+
+def airbyte_synced_tables(workspace_id: str, namespace_field: str, namespace: str) -> set[str]:
+    """Streams that Airbyte itself reports as successfully synced into `namespace`.
+
+    Asks Airbyte directly instead of reading anything the agent wrote (like terraform.tfstate),
+    so tables loaded around Airbyte, or synced into a sibling rollout's namespace, don't count.
+    """
+
+    def get(path: str) -> dict:
+        with urllib.request.urlopen(f"{AIRBYTE_API_URL}/{path}", timeout=30) as response:
+            return json.load(response)
+
+    tables = set()
+    for connection in get(f"connections?workspaceIds={workspace_id}&limit=100")["data"]:
+        destination = get(f"destinations/{connection['destinationId']}")
+        if str(destination["configuration"].get(namespace_field, "")).lower() != namespace.lower():
+            continue
+        if get(f"jobs?connectionId={connection['connectionId']}&jobType=sync&status=succeeded")["data"]:
+            tables |= {stream["name"].lower() for stream in connection["configurations"]["streams"]}
+    return tables
+
 
 def grade(
     task: EltTask,
@@ -94,15 +131,18 @@ def grade(
     namespace: str,
     built_models: set[str],
     has_seeds: bool,
+    airbyte_tables: set[str] | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Score the tables in `namespace` against the task's hidden evaluation data.
 
-    Stage 1 checks every source table was loaded with the right row count. Stage 2 only counts
+    Stage 1 checks every source table was loaded with the right row count (and, when
+    `airbyte_tables` is given, by a successful Airbyte sync). Stage 2 only counts
     once stage 1 passes (ELT-Bench's rule), and only for tables the re-executed dbt project built,
     so hand-made or stale tables earn nothing.
     """
     loaded = [
         _source_table_ok(task, connector, namespace, table, rows)
+        and (airbyte_tables is None or table.lower() in airbyte_tables)
         for table, rows in task.source_tables.items()
     ]
     el_frac = sum(loaded) / len(loaded)

@@ -31,8 +31,8 @@ def build_warehouse(workspace: Path, models: dict[str, str] | None = None, after
     con.close()
 
 
-def run_grade(workspace: Path, task=TASK, built_models=MODELS, has_seeds=False):
-    return grade(task, DuckDBDestination().connector(workspace), NAMESPACE, built_models, has_seeds)
+def run_grade(workspace: Path, task=TASK, built_models=MODELS, has_seeds=False, airbyte_tables=None):
+    return grade(task, DuckDBDestination().connector(workspace), NAMESPACE, built_models, has_seeds, airbyte_tables)
 
 
 def test_reference_solution_scores_one(tmp_path):
@@ -87,6 +87,15 @@ def test_airbyte_tasks_require_airbyte_columns(tmp_path):
     con.close()
     _, metrics = run_grade(tmp_path, task=airbyte_task)
     assert metrics["srdel"] == 1.0
+
+
+def test_tables_airbyte_did_not_sync_fail_stage_one(tmp_path):
+    build_warehouse(tmp_path)
+    _, metrics = run_grade(tmp_path, airbyte_tables={"customers", "orders"})
+    assert metrics["srdel"] == 1.0
+
+    _, metrics = run_grade(tmp_path, airbyte_tables={"customers"})
+    assert metrics["el_frac"] == 0.5 and metrics["srdel"] == 0.0
 
 
 def test_empty_warehouse_scores_zero(tmp_path):

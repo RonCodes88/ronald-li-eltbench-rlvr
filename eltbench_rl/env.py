@@ -3,6 +3,9 @@
 Follows tinker_cookbook/recipes/harbor_rl/harbor_env.py: one bash tool in a sandbox per rollout and a
 reward computed by execution when the episode ends. Each rollout also gets its own warehouse
 namespace, because the warehouse and Airbyte are shared between rollouts.
+
+With stage="transform", rollouts skip extract/load: their namespace is cloned from a snapshot of a
+verified load (saved by a full rollout with save_snapshot=True), and the prompt is stage 2 only.
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ from tinker_cookbook.tool_use import build_agent_tool_env
 from eltbench_rl.destinations import Destination, get_destination
 from eltbench_rl.docker_sandbox import DockerSandbox
 from eltbench_rl.reward import EltReward
-from eltbench_rl.tasks import EltTask, load_tasks
+from eltbench_rl.tasks import EltTask, load_tasks, transform_instruction
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +78,11 @@ class EltEnvGroupBuilder(EnvGroupBuilder):
         max_trajectory_tokens: int = 64 * 1024,
         max_generation_tokens: int | None = None,
         context_overflow_reward: float = -0.1,
+        stage: str = "full",
+        save_snapshot: bool = False,
     ):
+        if stage not in ("full", "transform"):
+            raise ValueError(f"stage must be 'full' or 'transform', got {stage!r}")
         self.task = task
         self.model_name = model_name
         self.renderer_name = renderer_name
@@ -83,8 +90,16 @@ class EltEnvGroupBuilder(EnvGroupBuilder):
         self.destination = destination
         self.credential_path = credential_path
         self.docker_image = docker_image
-        # Airbyte tasks need ELT-Bench's network; local tasks get no network at all.
-        self.docker_network = docker_network or (ELT_BENCH_NETWORK if task.uses_airbyte else "none")
+        self.stage = stage
+        self.snapshot = f"{task.name}__snapshot"
+        self.save_snapshot = save_snapshot
+        # Airbyte runs need ELT-Bench's network, other Snowflake runs only the internet, DuckDB nothing.
+        if docker_network:
+            self.docker_network = docker_network
+        elif task.uses_airbyte and stage == "full":
+            self.docker_network = ELT_BENCH_NETWORK
+        else:
+            self.docker_network = "none" if destination == "duckdb" else None
         self.workspace_root = workspace_root
         self.max_turns = max_turns
         self.command_timeout = command_timeout
@@ -109,17 +124,23 @@ class EltEnvGroupBuilder(EnvGroupBuilder):
 
         sandbox = await DockerSandbox.create(self.docker_image, workspace, self.docker_network)
         self._rollouts.append(_Rollout(sandbox, namespace, workspace))
-        await asyncio.to_thread(destination.create_namespace, namespace)
+        from_snapshot = self.snapshot if self.stage == "transform" else None
+        await asyncio.to_thread(destination.create_namespace, namespace, workspace, from_snapshot)
+        instruction = self.task.instruction if self.stage == "full" else transform_instruction(self.task.instruction)
 
         bash_tool = HarborBashTool(sandbox, command_timeout=self.command_timeout)
         initial_messages = renderer.create_conversation_prefix_with_tools(
             tools=[bash_tool.bash.to_spec()], system_prompt=SYSTEM_PROMPT
-        ) + [{"role": "user", "content": self.task.instruction}]
+        ) + [{"role": "user", "content": instruction}]
         return build_agent_tool_env(
             renderer=renderer,
             tools=[bash_tool.bash],
             initial_messages=initial_messages,
-            reward_fn=EltReward(self.task, destination, sandbox, workspace, namespace),
+            reward_fn=EltReward(
+                self.task, destination, sandbox, workspace, namespace,
+                check_airbyte_jobs=self.task.uses_airbyte and self.stage == "full",
+                save_snapshot_as=self.snapshot if self.save_snapshot else None,
+            ),  # fmt: skip
             # Every command shares one container, so run them in order; retry malformed tool calls.
             rollout_config=RolloutConfig(
                 parse_errors=ParseErrorPolicy(max_consecutive=2), tool_execution="sequential"
@@ -187,6 +208,7 @@ class EltDatasetBuilder(RLDatasetBuilder):
     command_timeout: int = 600
     max_trajectory_tokens: int = 64 * 1024
     max_generation_tokens: int | None = None
+    stage: str = "full"  # "transform": start from a snapshot of loaded sources, train dbt only
 
     async def __call__(self) -> tuple[RLDataset, RLDataset | None]:
         names = [name.strip() for name in self.tasks.split(",") if name.strip()] or None
@@ -205,6 +227,7 @@ class EltDatasetBuilder(RLDatasetBuilder):
                 command_timeout=self.command_timeout,
                 max_trajectory_tokens=self.max_trajectory_tokens,
                 max_generation_tokens=self.max_generation_tokens,
+                stage=self.stage,
             )
             for task in load_tasks(Path(self.bench_dir), self.destination, names)
         ]

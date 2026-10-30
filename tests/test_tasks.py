@@ -3,7 +3,7 @@ from pathlib import Path
 import pandas as pd
 
 from eltbench_rl import ELT_BENCH_DIR
-from eltbench_rl.tasks import elt_bench_instruction, ground_truth_dir, load_tasks
+from eltbench_rl.tasks import elt_bench_instruction, ground_truth_dir, load_tasks, transform_instruction
 
 TOY_BENCH = Path(__file__).parent / "fixtures" / "toy_bench"
 
@@ -35,6 +35,15 @@ def test_elt_bench_instruction():
 
     assert text.startswith("Build the ELT pipeline for the `trains` now.")
     assert "Airbyte" in text and "Snowflake" in text
+
+
+def test_transform_instruction_keeps_only_stage_two():
+    [task] = load_tasks(TOY_BENCH, "duckdb")
+    for text in (task.instruction, elt_bench_instruction("trains", "snowflake")):
+        stage_two = transform_instruction(text)
+
+        assert "# Stage 1" not in stage_two and "terraform init" not in stage_two
+        assert "# Stage 2" in stage_two and "dbt run" in stage_two.lower()
 
 
 def test_official_ground_truth_download():

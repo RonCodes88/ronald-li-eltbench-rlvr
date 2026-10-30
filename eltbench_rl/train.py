@@ -39,6 +39,7 @@ class CLIConfig:
     max_turns: int = 100
     command_timeout: int = 600
     max_trajectory_tokens: int = 64 * 1024
+    stage: str = "full"  # "transform": dbt-only rollouts from a saved snapshot of loaded sources
 
     # Training hyperparameters
     group_size: int = 4
@@ -87,6 +88,7 @@ async def cli_main(cli_config: CLIConfig) -> None:
         command_timeout=cli_config.command_timeout,
         max_trajectory_tokens=cli_config.max_trajectory_tokens,
         max_generation_tokens=cli_config.max_tokens,
+        stage=cli_config.stage,
     )
 
     config = Config(

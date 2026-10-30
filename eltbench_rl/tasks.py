@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,6 +67,15 @@ def elt_bench_instruction(name: str, destination: str) -> str:
         f"Build the ELT pipeline for the `{name}` now. All configuration values "
         f"(including the {display_name} namespace) must come from /workspace/config.yaml.\n\n"
         + warehouse.adapt_prompt(ELT_BENCH_GOAL + "\n" + TASK_INSTRUCTION, destination)
+    )
+
+
+def transform_instruction(instruction: str) -> str:
+    """Only the transformation stage of a task's instruction, for rollouts that start from a snapshot."""
+    _, stage_two = re.split(r"^#\s*Stage 2", instruction, maxsplit=1, flags=re.MULTILINE)
+    return (
+        "The source tables are already loaded into the warehouse namespace given in /workspace/config.yaml, "
+        "so skip extraction and loading and only build the transformations.\n\n# Stage 2" + stage_two
     )
 
 

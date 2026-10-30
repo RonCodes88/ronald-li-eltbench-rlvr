@@ -2,7 +2,8 @@
 
 Needs the official setup from the README (Snowflake credentials, local Airbyte, ELT-Bench sources and
 generated inputs); skipped otherwise. The oracle does what an agent should: read /workspace/config.yaml,
-configure Airbyte with Terraform, trigger and wait for the syncs, then build the dbt model.
+configure Airbyte with Terraform, trigger and wait for the syncs, then build the dbt model. It also
+saves the snapshot of loaded sources that transform-stage training starts from.
 """
 
 import asyncio
@@ -92,9 +93,9 @@ def count_airbyte_connections() -> int:
         return len(json.load(response)["data"])
 
 
-def test_oracle_pipeline_scores_one(tmp_path):
+def make_builder(tmp_path, **kwargs) -> EltEnvGroupBuilder:
     [task] = load_tasks(ELT_BENCH_DIR, "snowflake", ["trains"])
-    builder = EltEnvGroupBuilder(
+    return EltEnvGroupBuilder(
         task=task,
         model_name=MODEL,
         renderer_name=None,
@@ -106,20 +107,36 @@ def test_oracle_pipeline_scores_one(tmp_path):
         workspace_root=str(tmp_path),
         max_turns=10,
         command_timeout=900,
+        **kwargs,
     )
+
+
+def run_oracle(builder: EltEnvGroupBuilder, commands: list[str]):
     renderer = get_renderer(model_info.get_recommended_renderer_name(MODEL), tokenizer_utils.get_tokenizer(MODEL))
-    connections_before = count_airbyte_connections()
 
     async def run():
         [env] = await builder.make_envs()
         namespace = builder._rollouts[0].namespace
         try:
-            trajectory = await do_single_rollout(ScriptedPolicy(renderer, ORACLE_COMMANDS), env)
+            trajectory = await do_single_rollout(ScriptedPolicy(renderer, commands), env)
         finally:
             await builder.cleanup()
         return trajectory, namespace
 
-    trajectory, namespace = asyncio.run(run())
+    return asyncio.run(run())
+
+
+def database_exists(name: str) -> bool:
+    admin = get_destination("snowflake", str(CREDENTIAL)).connector(None)
+    try:
+        return not admin.query(f"show databases like '{name}'").empty
+    finally:
+        admin.close()
+
+
+def test_oracle_pipeline_scores_one(tmp_path):
+    connections_before = count_airbyte_connections()
+    trajectory, namespace = run_oracle(make_builder(tmp_path, save_snapshot=True), ORACLE_COMMANDS)
     metrics = trajectory.transitions[-1].metrics
     print(namespace, metrics)
 
@@ -127,9 +144,17 @@ def test_oracle_pipeline_scores_one(tmp_path):
     assert metrics["srdel"] == 1.0 and metrics["srdt"] == 1.0
     assert "grading_error" not in metrics
 
-    admin = get_destination("snowflake", str(CREDENTIAL)).connector(None)
-    try:
-        assert admin.query(f"show databases like '{namespace}'").empty
-    finally:
-        admin.close()
+    assert not database_exists(namespace)
     assert count_airbyte_connections() == connections_before
+    assert database_exists("trains__snapshot")
+
+
+def test_transform_stage_from_snapshot_scores_one(tmp_path):
+    # Runs after the oracle above saved the snapshot: only render the files and run dbt.
+    builder = make_builder(tmp_path, stage="transform")
+    trajectory, _ = run_oracle(builder, [RENDER, ORACLE_COMMANDS[-1]])
+    metrics = trajectory.transitions[-1].metrics
+    print(metrics)
+
+    assert sum(t.reward for t in trajectory.transitions) == pytest.approx(1.0)
+    assert builder.docker_network is None  # no Airbyte network needed, only the internet

@@ -1,8 +1,10 @@
 """Warehouses the environment can load into and grade against.
 
 A destination says which config.yaml field holds the per-rollout namespace, how to create and drop
-that namespace, and which ELT-Bench connector reads it back for grading. Supporting another
-warehouse means adding one class here; the environment itself does not change.
+that namespace, and which ELT-Bench connector reads it back for grading. A snapshot is a saved copy
+of a verified extract/load, so transform-only rollouts can start from loaded sources without
+re-running Airbyte. Supporting another warehouse means adding one class here; the environment
+itself does not change.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ from typing import Protocol
 
 import duckdb
 from db_connectors import BaseConnector, SnowflakeConnector
+from tinker_cookbook import cli_utils
 
 
 class Destination(Protocol):
@@ -21,9 +24,11 @@ class Destination(Protocol):
 
     def connector(self, workspace: Path) -> BaseConnector: ...
 
-    def create_namespace(self, namespace: str) -> None: ...
+    def create_namespace(self, namespace: str, workspace: Path, snapshot: str | None = None) -> None: ...
 
     def drop_namespace(self, namespace: str) -> None: ...
+
+    def save_snapshot(self, namespace: str, workspace: Path, snapshot: str, tables: list[str]) -> None: ...
 
 
 class DuckDBConnector(BaseConnector):
@@ -56,15 +61,38 @@ class DuckDBDestination:
 
     name = "duckdb"
     namespace_field = "schema"
+    snapshot_dir = Path(cli_utils.runs_path("eltbench_snapshots"))
 
     def connector(self, workspace: Path) -> BaseConnector:
         return DuckDBConnector({"path": str(workspace / "warehouse.duckdb")})
 
-    def create_namespace(self, namespace: str) -> None:
-        pass  # every rollout has its own database file
+    def create_namespace(self, namespace: str, workspace: Path, snapshot: str | None = None) -> None:
+        if snapshot is None:
+            return  # every rollout has its own database file, which the agent creates
+        con = duckdb.connect(str(workspace / "warehouse.duckdb"))
+        try:
+            con.execute(f"ATTACH '{self.snapshot_dir / snapshot}.duckdb' AS snapshot (READ_ONLY)")
+            con.execute(f'CREATE SCHEMA "{namespace}"')
+            tables = con.execute("SELECT table_name FROM duckdb_tables() WHERE database_name = 'snapshot'").fetchall()
+            for (table,) in tables:
+                con.execute(f'CREATE TABLE "{namespace}"."{table}" AS FROM snapshot."{table}"')
+        finally:
+            con.close()
 
     def drop_namespace(self, namespace: str) -> None:
         pass
+
+    def save_snapshot(self, namespace: str, workspace: Path, snapshot: str, tables: list[str]) -> None:
+        path = self.snapshot_dir / f"{snapshot}.duckdb"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.unlink(missing_ok=True)
+        con = duckdb.connect(str(path))
+        try:
+            con.execute(f"ATTACH '{workspace / 'warehouse.duckdb'}' AS rollout (READ_ONLY)")
+            for table in tables:
+                con.execute(f'CREATE TABLE "{table}" AS FROM rollout."{namespace}"."{table}"')
+        finally:
+            con.close()
 
 
 class SnowflakeDestination:
@@ -79,15 +107,32 @@ class SnowflakeDestination:
     def connector(self, workspace: Path | None = None) -> BaseConnector:
         return SnowflakeConnector(json.loads(Path(self.credential_path).read_text()))
 
-    def create_namespace(self, namespace: str) -> None:
+    def create_namespace(self, namespace: str, workspace: Path, snapshot: str | None = None) -> None:
         # Same as ELT-Bench's example/create_snowflake_db.py: the Airbyte role owns the database.
-        self._execute(
-            f"CREATE OR REPLACE DATABASE {namespace}",
-            f"GRANT OWNERSHIP ON DATABASE {namespace} TO ROLE AIRBYTE_ROLE",
-        )
+        if snapshot is None:
+            self._execute(
+                f"CREATE OR REPLACE DATABASE {namespace}",
+                f"GRANT OWNERSHIP ON DATABASE {namespace} TO ROLE AIRBYTE_ROLE",
+            )
+        else:
+            # Zero-copy clone: instant, and the clone's tables are independent of the snapshot.
+            self._execute(
+                f"CREATE OR REPLACE DATABASE {namespace} CLONE {snapshot}",
+                f"GRANT OWNERSHIP ON DATABASE {namespace} TO ROLE AIRBYTE_ROLE COPY CURRENT GRANTS",
+                f"GRANT OWNERSHIP ON SCHEMA {namespace}.AIRBYTE_SCHEMA TO ROLE AIRBYTE_ROLE COPY CURRENT GRANTS",
+                f"GRANT OWNERSHIP ON ALL TABLES IN SCHEMA {namespace}.AIRBYTE_SCHEMA TO ROLE AIRBYTE_ROLE COPY CURRENT GRANTS",
+            )
 
     def drop_namespace(self, namespace: str) -> None:
         self._execute(f"DROP DATABASE IF EXISTS {namespace}")
+
+    def save_snapshot(self, namespace: str, workspace: Path, snapshot: str, tables: list[str]) -> None:
+        # Copy only the source tables, so a snapshot never carries a previous rollout's dbt models.
+        self._execute(
+            f"CREATE OR REPLACE DATABASE {snapshot}",
+            f"CREATE SCHEMA {snapshot}.AIRBYTE_SCHEMA",
+            *[f"CREATE TABLE {snapshot}.AIRBYTE_SCHEMA.{t} CLONE {namespace}.AIRBYTE_SCHEMA.{t}" for t in tables],
+        )
 
     def _execute(self, *statements: str) -> None:
         connector = self.connector()
