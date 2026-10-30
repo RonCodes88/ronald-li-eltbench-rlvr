@@ -30,6 +30,7 @@ uv run pytest            # the official-task test skips itself unless the offici
 | Wrote the result tables by hand instead of with dbt | 0.2 |
 | Hardcoded the answers as dbt seeds | 0.2 |
 | Forged dbt `run_results.json` | 0.2 |
+| Computed the answers by hand into helper tables, with dbt models that copy them | 0.2 (1.0 before the clean re-run) |
 | One model partly wrong | 0.79 |
 | Did nothing | 0.0 |
 
@@ -59,7 +60,7 @@ uv run python -m eltbench_rl.train tasks=trains destination=snowflake stage=tran
     group_size=4 max_turns=30 max_steps=1
 ```
 
-In our toy run the group's rewards were `[1.0, 1.0, 0.2, 1.0]`. In our official transform-stage run on `trains` they were `[1.0, 0.9, 1.0, 0.2]`: two rollouts built the model exactly, so both runs give non-zero GRPO advantages. The official step took 283 s (257 s of it sampling, 30 turns at most per rollout, grading 6.5 s per rollout) and used about 0.8M prompt and 49K sampled tokens on the 64K model. For comparison, our single full-pipeline `trains` rollout took 549 s and still scored 0.2. Metrics go to `metrics.jsonl` under the log path (`env/all/reward/total`, `env/all/srdel`, `env/all/srdt`, ...).
+In our toy run the group's rewards were `[1.0, 1.0, 0.2, 1.0]`. On the official `trains` task (transform stage, final code with all the anti-hacking checks) they were `[1.0, 0.9, 0.2, 0.9]`, so both runs give non-zero GRPO advantages. The official step took 254 s: 238 s of sampling (4 rollouts in parallel, 30 turns each), 15.5 s of grading per rollout and an 8 s training step, using about 0.86M prompt and 51K sampled tokens on the 64K model. For comparison, our single full-pipeline `trains` rollout took 549 s and scored 0.2. Metrics go to `metrics.jsonl` under the log path (`env/all/reward/total`, `env/all/srdel`, `env/all/srdt`, ...).
 
 ## Official setup (Snowflake + local Airbyte)
 
@@ -88,17 +89,24 @@ This follows [ELT-Bench's README](third_party/ELT-Bench/README.md), with fixes f
    cd ../elt-docker && docker compose up -d python-rest-api   # or all services for other tasks
    docker network connect elt-docker_elt_network airbyte-abctl-control-plane
    ```
-5. **Task inputs.** `cd third_party/ELT-Bench/setup && uv run --project ../../.. python write_config.py --destination snowflake`. Ground-truth CSVs download automatically from HuggingFace (`tttjjj/elt_bench`) on first use.
+5. **Sandbox network.** `docker/sandbox-network.sh` (once). It creates an internal Docker network whose only exits are the Airbyte control plane and a proxy that lets HTTPS through to `*.snowflakecomputing.com`, and nothing else.
+6. **Task inputs.** `cd third_party/ELT-Bench/setup && uv run --project ../../.. python write_config.py --destination snowflake`. Ground-truth CSVs download automatically from HuggingFace (`tttjjj/elt_bench`) on first use.
 
 ## How it works
 
-**Episode.** Each rollout gets a copy of the task bundle (without admin credentials), its own warehouse namespace `<task>__<uuid8>` written into `config.yaml`, and its own container. The container joins ELT-Bench's Docker network when it has to run Airbyte, uses Docker's default network when it only needs Snowflake, and gets no network for DuckDB. The model's only tool is the cookbook's `HarborBashTool`. The episode ends when the model replies without a tool call, which submits the pipeline, or when it hits 100 turns, the token budget, or too many malformed tool calls in a row. Cleanup runs `terraform destroy`, drops the namespace and removes the container.
+**Episode.** Each rollout gets a copy of the task bundle (without admin credentials), its own warehouse namespace `<task>__<uuid8>`, and its own container. On Snowflake the namespace is a database owned by a throwaway role and user made for this rollout, and their credentials replace the shared `AIRBYTE_USER` in the rollout's `config.yaml`. The container sits on the internal `eltbench-sandbox` network (Airbyte plus Snowflake through the proxy), or on no network at all for DuckDB. The model's only tool is the cookbook's `HarborBashTool`. The episode ends when the model replies without a tool call, which submits the pipeline, or when it hits 100 turns, the token budget, or too many malformed tool calls in a row. Cleanup runs `terraform destroy`, drops the namespace (and its role and user) and removes the container.
 
 **Transform stage.** With `stage=transform`, a rollout skips extract/load. Its namespace is a zero-copy Snowflake clone of a snapshot (for DuckDB, a copy of a small file), and its prompt is only stage 2 of the instruction. Snapshots hold only source tables, are saved by a full rollout with `save_snapshot=true` once it passes stage 1, and never enter the sandbox. This skips Airbyte's ~3.5 minutes per rollout and puts the training signal on dbt, where the model fails: in a group where every rollout finishes the load and none finishes dbt, all rewards are 0.2 and GRPO learns nothing.
 
 **Reward.** `0.2·el_frac + 0.1·built_frac + 0.7·col_frac`, where `el_frac` is the share of source tables loaded with the right row count and, for Airbyte tasks, synced by a job that Airbyte's API reports as succeeded into this rollout's namespace, `built_frac` is the share of models our own dbt re-run built, and `col_frac` is the share of ground-truth columns that match, using ELT-Bench's `check_corretness`. As in ELT-Bench, the last two terms only count once every source table is loaded. ELT-Bench's own metrics (SRDEL, SRDT) are logged too.
 
-**Anti-hacking.** Hidden data never enters the sandbox, only tables built by our dbt re-run are graded, and seeds and forged dbt artifacts are rejected. Loading around Airbyte doesn't count, because stage 1 asks Airbyte which streams it actually synced instead of trusting anything in the sandbox. Still open: on official tasks the sandbox has internet access, rollouts share one Snowflake role, and a model could edit source values after a successful sync.
+**Anti-hacking.**
+- Hidden data never enters the sandbox, and the sandbox can't download it: it reaches only Airbyte and Snowflake.
+- Each rollout's Snowflake user can only see its own database, so it can't read or damage a sibling's tables.
+- Stage 1 asks Airbyte which streams it actually synced into this namespace, so loading around Airbyte doesn't count.
+- Before grading, the namespace is rebuilt with only the source tables (re-cloned from the snapshot in transform mode) and our own dbt run rebuilds every model from them. Hand-made tables, helper tables and staged files don't survive (nor, in transform mode, edited sources), and forged dbt artifacts and seeds are rejected.
+
+Still open: answers hardcoded into a model's SQL (for example a `VALUES` list the model worked out with ad-hoc queries); Airbyte itself, which is shared and has no auth in this local setup, so a model could change a sibling's connections or point a source at a URL serving the ground truth; and in full mode, editing source values after a sync.
 
 ## Adding a warehouse
 
@@ -115,7 +123,8 @@ eltbench_rl/
   env.py             EltEnvGroupBuilder, dataset and dataset builder (mirrors harbor_rl)
   train.py           RL training CLI (mirrors harbor_rl/train.py)
   rollout.py         single-rollout CLI (mirrors harbor_rl/eval.py)
-docker/              sandbox Dockerfile, Terraform provider mirror config, Airbyte values
+docker/              sandbox Dockerfile, Terraform provider mirror config, Airbyte values,
+                     egress proxy (proxy/) and sandbox-network.sh
 tests/               unit tests, credential-free integration test, official oracle test
 third_party/ELT-Bench  submodule, pinned at fcf3129
 ```
