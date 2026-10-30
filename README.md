@@ -33,6 +33,8 @@ uv run pytest            # the official-task test skips itself unless the offici
 | One model partly wrong | 0.79 |
 | Did nothing | 0.0 |
 
+The same file also checks the transform stage (below): the correct pipeline saves a snapshot of its loaded sources, and a second group starts from that snapshot, where dbt alone scores 1.0 and doing nothing scores 0.2.
+
 **2. Credentialed rollout on an official ELT-Bench task.** Needs the Official setup below and `TINKER_API_KEY`.
 
 ```bash
@@ -42,6 +44,8 @@ uv run python -m eltbench_rl.rollout task=trains destination=snowflake \
 uv run pytest tests/test_official_trains.py -s   # hand-written oracle on the same task: reward 1.0
 ```
 
+The oracle test also saves `TRAINS__SNAPSHOT`, a copy of the loaded source tables, and then checks that a dbt-only run starting from it scores 1.0 too.
+
 Official tasks need the 256K-context model variant: with a 64K budget, our first `trains` rollout ran out of tokens after 7 turns. The rollout prints the reward breakdown and saves `result.json` and a transcript under `~/tinker-runs/eltbench_rollouts/`. On `trains`, the base Qwen3.6-35B-A3B completed the whole Airbyte stage on its own (SRDEL 1.0, reward 0.2) but ran out of turns before dbt.
 
 **3. A Tinker RL optimization step with execution-derived rewards.** Needs `TINKER_API_KEY`.
@@ -49,13 +53,13 @@ Official tasks need the 256K-context model variant: with a 64K budget, our first
 ```bash
 uv run python -m eltbench_rl.train bench_dir=tests/fixtures/toy_bench destination=duckdb tasks=shop \
     group_size=4 max_turns=20 max_steps=1
-# same on an official task (we have only run the toy step above):
-uv run python -m eltbench_rl.train tasks=trains destination=snowflake max_steps=1 \
+# official task, transform stage (needs the TRAINS__SNAPSHOT saved by the oracle test):
+uv run python -m eltbench_rl.train tasks=trains destination=snowflake stage=transform \
     credential_path=third_party/ELT-Bench/setup/destination/snowflake_credential.json \
-    model_name=Qwen/Qwen3.6-35B-A3B:peft:262144 max_trajectory_tokens=200000
+    group_size=4 max_turns=30 max_steps=1
 ```
 
-In our run of the toy step the group's rewards were `[1.0, 1.0, 0.2, 1.0]`, which gives non-zero GRPO advantages. Metrics go to `metrics.jsonl` under the log path (`env/all/reward/total`, `env/all/srdel`, `env/all/srdt`, ...).
+In our toy run the group's rewards were `[1.0, 1.0, 0.2, 1.0]`. In our official transform-stage run on `trains` they were `[1.0, 0.9, 1.0, 0.2]`: two rollouts built the model exactly, so both runs give non-zero GRPO advantages. The official step took 283 s (257 s of it sampling, 30 turns at most per rollout, grading 6.5 s per rollout) and used about 0.8M prompt and 49K sampled tokens on the 64K model. For comparison, our single full-pipeline `trains` rollout took 549 s and still scored 0.2. Metrics go to `metrics.jsonl` under the log path (`env/all/reward/total`, `env/all/srdel`, `env/all/srdt`, ...).
 
 ## Official setup (Snowflake + local Airbyte)
 
@@ -88,15 +92,17 @@ This follows [ELT-Bench's README](third_party/ELT-Bench/README.md), with fixes f
 
 ## How it works
 
-**Episode.** Each rollout gets a copy of the task bundle (without admin credentials), its own warehouse namespace `<task>__<uuid8>` written into `config.yaml`, and its own container. The container joins ELT-Bench's Docker network for Airbyte tasks and has no network for local ones. The model's only tool is the cookbook's `HarborBashTool`. The episode ends when the model replies without a tool call, which submits the pipeline, or when it hits 100 turns, the token budget, or too many malformed tool calls in a row. Cleanup runs `terraform destroy`, drops the namespace and removes the container.
+**Episode.** Each rollout gets a copy of the task bundle (without admin credentials), its own warehouse namespace `<task>__<uuid8>` written into `config.yaml`, and its own container. The container joins ELT-Bench's Docker network when it has to run Airbyte, uses Docker's default network when it only needs Snowflake, and gets no network for DuckDB. The model's only tool is the cookbook's `HarborBashTool`. The episode ends when the model replies without a tool call, which submits the pipeline, or when it hits 100 turns, the token budget, or too many malformed tool calls in a row. Cleanup runs `terraform destroy`, drops the namespace and removes the container.
 
-**Reward.** `0.2·el_frac + 0.1·built_frac + 0.7·col_frac`, where `el_frac` is the share of source tables Airbyte loaded with the right row count, `built_frac` is the share of models our own dbt re-run built, and `col_frac` is the share of ground-truth columns that match, using ELT-Bench's `check_corretness`. As in ELT-Bench, the last two terms only count once every source table is loaded. ELT-Bench's own metrics (SRDEL, SRDT) are logged too.
+**Transform stage.** With `stage=transform`, a rollout skips extract/load. Its namespace is a zero-copy Snowflake clone of a snapshot (for DuckDB, a copy of a small file), and its prompt is only stage 2 of the instruction. Snapshots hold only source tables, are saved by a full rollout with `save_snapshot=true` once it passes stage 1, and never enter the sandbox. This skips Airbyte's ~3.5 minutes per rollout and puts the training signal on dbt, where the model fails: in a group where every rollout finishes the load and none finishes dbt, all rewards are 0.2 and GRPO learns nothing.
 
-**Anti-hacking.** Hidden data never enters the sandbox, only tables built by our dbt re-run are graded, and seeds and forged dbt artifacts are rejected. Still open: on official tasks the sandbox has internet access, rollouts share one Snowflake role, and the Airbyte check (an `_airbyte_raw_id` column) could be faked by adding that column by hand.
+**Reward.** `0.2·el_frac + 0.1·built_frac + 0.7·col_frac`, where `el_frac` is the share of source tables loaded with the right row count and, for Airbyte tasks, synced by a job that Airbyte's API reports as succeeded into this rollout's namespace, `built_frac` is the share of models our own dbt re-run built, and `col_frac` is the share of ground-truth columns that match, using ELT-Bench's `check_corretness`. As in ELT-Bench, the last two terms only count once every source table is loaded. ELT-Bench's own metrics (SRDEL, SRDT) are logged too.
+
+**Anti-hacking.** Hidden data never enters the sandbox, only tables built by our dbt re-run are graded, and seeds and forged dbt artifacts are rejected. Loading around Airbyte doesn't count, because stage 1 asks Airbyte which streams it actually synced instead of trusting anything in the sandbox. Still open: on official tasks the sandbox has internet access, rollouts share one Snowflake role, and a model could edit source values after a successful sync.
 
 ## Adding a warehouse
 
-Write a class with the `Destination` protocol from `eltbench_rl/destinations.py` (`name`, `namespace_field`, `connector()`, `create_namespace()`, `drop_namespace()`), register it in `get_destination`, and generate task inputs with ELT-Bench's `write_config.py --destination <name>`. ELT-Bench already has `DatabricksConnector` and `RedshiftConnector` in `evaluation/db_connectors.py` for grading. The environment code doesn't change. Only Snowflake and DuckDB are implemented and tested.
+Write a class with the `Destination` protocol from `eltbench_rl/destinations.py` (`name`, `namespace_field`, `connector()`, `create_namespace()`, `drop_namespace()`, and `save_snapshot()` if you want the transform stage), register it in `get_destination`, and generate task inputs with ELT-Bench's `write_config.py --destination <name>`. ELT-Bench already has `DatabricksConnector` and `RedshiftConnector` in `evaluation/db_connectors.py` for grading. The environment code doesn't change. Only Snowflake and DuckDB are implemented and tested.
 
 ## Layout
 
