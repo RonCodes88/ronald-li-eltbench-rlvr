@@ -48,7 +48,7 @@ uv run pytest tests/test_official_trains.py -s   # hand-written oracle on the sa
 
 The oracle test also saves `TRAINS__SNAPSHOT`, the task's reference load of its source tables, and then checks that a dbt-only run starting from it scores 1.0 too. The same file checks the sandbox network: Snowflake and the Airbyte gate are reachable, Airbyte itself, HuggingFace, GitHub and PyPI are not, and through the gate a rollout can reach only its own Airbyte workspace.
 
-Official tasks need the 256K-context model variant: with a 64K budget, our first `trains` rollout ran out of tokens after 7 turns. The rollout prints the reward breakdown and saves `result.json` and a transcript under `~/tinker-runs/eltbench_rollouts/`. On `trains`, the base Qwen3.6-35B-A3B completed the whole Airbyte stage on its own (SRDEL 1.0, reward 0.2) but ran out of turns before dbt.
+Official tasks need the 256K-context model variant: with a 64K budget, our first `trains` rollout ran out of tokens after 7 turns. The rollout prints the reward breakdown and saves `result.json` and a transcript under `~/tinker-runs/eltbench_rollouts/`. On the final code, the base Qwen3.6-35B-A3B solved `trains` end to end: it configured Airbyte through the gate with Terraform, waited for both syncs, and wrote a dbt model that computes the answers from the loaded `TRAIN` and `CARS` tables. Reward 1.0 (SRDEL 1, SRDT 1, nothing flagged as hardcoded) in 40 turns and 421 s, of which 30.5 s was grading. An earlier full rollout, before the gate, finished the Airbyte stage but ran out of turns before dbt (reward 0.2), so one rollout per configuration says little about the success rate.
 
 **3. A Tinker RL optimization step with execution-derived rewards.** Needs `TINKER_API_KEY`.
 
@@ -58,10 +58,10 @@ uv run python -m eltbench_rl.train bench_dir=tests/fixtures/toy_bench destinatio
 # official task, transform stage (needs the TRAINS__SNAPSHOT saved by the oracle test):
 uv run python -m eltbench_rl.train tasks=trains destination=snowflake stage=transform \
     credential_path=third_party/ELT-Bench/setup/destination/snowflake_credential.json \
-    group_size=4 max_turns=30 max_steps=1
+    group_size=4 max_turns=30 num_epochs=3   # one task, so each epoch is one step
 ```
 
-In our toy run the group's rewards were `[1.0, 1.0, 0.2, 1.0]`. On the official `trains` task (transform stage, final code with all the anti-hacking checks) they were `[1.0, 0.9, 0.2, 0.9]`, so both runs give non-zero GRPO advantages. The official step took 254 s: 238 s of sampling (4 rollouts in parallel, 30 turns each), 15.5 s of grading per rollout and an 8 s training step, using about 0.86M prompt and 51K sampled tokens on the 64K model. For comparison, our single full-pipeline `trains` rollout took 549 s and scored 0.2. Metrics go to `metrics.jsonl` under the log path (`env/all/reward/total`, `env/all/srdel`, `env/all/srdt`, ...).
+In our toy run the group's rewards were `[1.0, 1.0, 0.2, 1.0]`. On the official `trains` task (transform stage, final code with every anti-hacking check), a one-step run gave `[1.0, 0.9, 0.9, 0.2]`: 274 s in total, 261 s of it sampling (4 rollouts in parallel, 30 turns each), about 25 s of grading per rollout and a 9 s training step, on 0.96M prompt and 74K sampled tokens with the 64K model. A three-step run then gave means of 0.55, 0.375 and 0.2 (`[0.9, 0.2, 0.2, 0.9]`, `[0.2, 0.9, 0.2, 0.2]`, `[0.2, 0.2, 0.2, 0.2]`). The loop works across steps (steps 1 and 2 sample from the updated weights), but four samples of one task per step at the default LoRA learning rate (5e-4) is far too little to show learning, and the last group had no reward variance, so no gradient. Metrics go to `metrics.jsonl` under the log path (`env/all/reward/total`, `env/all/srdel`, `env/all/srdt`, `env/all/hardcoded_frac`, ...).
 
 ## Official setup (Snowflake + local Airbyte)
 
