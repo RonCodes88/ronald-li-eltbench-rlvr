@@ -232,6 +232,7 @@ class EltDatasetBuilder(RLDatasetBuilder):
     max_trajectory_tokens: int = 64 * 1024
     max_generation_tokens: int | None = None
     stage: str = "full"  # "transform": start from a snapshot of loaded sources, train dbt only
+    num_epochs: int = 1  # passes over the tasks; each pass is one batch per `batch_size` tasks
 
     async def __call__(self) -> tuple[RLDataset, RLDataset | None]:
         names = [name.strip() for name in self.tasks.split(",") if name.strip()] or None
@@ -254,4 +255,4 @@ class EltDatasetBuilder(RLDatasetBuilder):
             )
             for task in load_tasks(Path(self.bench_dir), self.destination, names)
         ]
-        return EltDataset(builders, self.batch_size), None
+        return EltDataset(builders * self.num_epochs, self.batch_size), None
