@@ -37,12 +37,16 @@ class DockerSandbox:
         self.container = container
 
     @classmethod
-    async def create(cls, image: str, workspace: Path, network: str | None) -> DockerSandbox:
+    async def create(
+        cls, image: str, workspace: Path, network: str | None, env: dict[str, str] | None = None
+    ) -> DockerSandbox:
         container = f"eltbench-{uuid.uuid4().hex[:8]}"
         args = ["run", "-d", "--rm", "--name", container]
         args += ["-v", f"{workspace.resolve()}:/workspace", "-w", "/workspace"]
         if network:
             args += ["--network", network]
+        for name, value in (env or {}).items():
+            args += ["-e", f"{name}={value}"]
         code, _, stderr = await _docker(*args, image, "sleep", "infinity")
         if code != 0:
             raise RuntimeError(f"docker run failed: {stderr.decode(errors='replace')}")

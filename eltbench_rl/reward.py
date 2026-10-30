@@ -35,7 +35,10 @@ AIRBYTE_API_URL = "http://localhost:8001/api/public/v1"
 class EltReward:
     """Grade a finished rollout: re-run the submitted dbt project, then `grade` the warehouse.
 
-    Same shape as the cookbook's HarborReward: called once at episode end, before the sandbox goes away.
+    Before the re-run, the namespace is rebuilt with only the source tables, so dbt has to compute
+    every model from the sources: tables the agent made by hand, staged files and anything else it
+    left in the warehouse are gone. Same shape as the cookbook's HarborReward: called once at
+    episode end, before the sandbox goes away.
     """
 
     task: EltTask
@@ -44,21 +47,25 @@ class EltReward:
     workspace: Path  # host directory mounted at /workspace
     namespace: str
     check_airbyte_jobs: bool  # False when the sources came from a snapshot instead of Airbyte
+    restore_from: str | None = None  # snapshot the sources came from; the re-run starts from it again
     save_snapshot_as: str | None = None  # keep a copy of the sources once they pass stage 1
     dbt_timeout: int = 900
 
     async def __call__(self, history: list[Message]) -> tuple[float, dict[str, float]]:
         start = time.monotonic()
         try:
-            built_models, has_seeds, dbt_ok = await self._rerun_dbt()
             airbyte_tables = await asyncio.to_thread(self._airbyte_tables) if self.check_airbyte_jobs else None
-            connector = self.destination.connector(self.workspace)
-            try:
-                reward, metrics = await asyncio.to_thread(
-                    grade, self.task, connector, self.namespace, built_models, has_seeds, airbyte_tables
+            built_models, has_seeds, dbt_ok = set(), False, False
+            # Stage 2 only counts once stage 1 passes, so only then is the dbt re-run worth doing.
+            if all(await asyncio.to_thread(self._with_connector, sources_loaded, airbyte_tables)):
+                tables = list(self.task.source_tables)
+                await asyncio.to_thread(
+                    self.destination.reset_namespace, self.namespace, self.workspace, tables, self.restore_from
                 )
-            finally:
-                connector.close()
+                built_models, has_seeds, dbt_ok = await self._rerun_dbt()
+            reward, metrics = await asyncio.to_thread(
+                self._with_connector, grade, built_models, has_seeds, airbyte_tables
+            )
             if self.save_snapshot_as and metrics["srdel"] == 1.0:
                 await asyncio.to_thread(
                     self.destination.save_snapshot,
@@ -98,6 +105,13 @@ class EltReward:
             for node in json.loads((target / "manifest.json").read_text())["nodes"].values()
         )
         return built, has_seeds, result.exit_code == 0
+
+    def _with_connector(self, fn, *args):
+        connector = self.destination.connector(self.workspace)
+        try:
+            return fn(self.task, connector, self.namespace, *args)
+        finally:
+            connector.close()
 
     def _airbyte_tables(self) -> set[str]:
         workspace_id = yaml.safe_load((self.workspace / "config.yaml").read_text())["Airbyte"]["config"]["workspace_id"]
@@ -140,11 +154,7 @@ def grade(
     once stage 1 passes (ELT-Bench's rule), and only for tables the re-executed dbt project built,
     so hand-made or stale tables earn nothing.
     """
-    loaded = [
-        _source_table_ok(task, connector, namespace, table, rows)
-        and (airbyte_tables is None or table.lower() in airbyte_tables)
-        for table, rows in task.source_tables.items()
-    ]
+    loaded = sources_loaded(task, connector, namespace, airbyte_tables)
     el_frac = sum(loaded) / len(loaded)
     srdel = float(all(loaded))
 
@@ -171,6 +181,17 @@ def grade(
         "srdt": srdt,
         "pipeline_success": float(srdel == 1.0 and srdt == 1.0),
     }
+
+
+def sources_loaded(
+    task: EltTask, connector: BaseConnector, namespace: str, airbyte_tables: set[str] | None = None
+) -> list[bool]:
+    """Stage 1, per source table: loaded with the right row count (by Airbyte, when it's checked)."""
+    return [
+        _source_table_ok(task, connector, namespace, table, rows)
+        and (airbyte_tables is None or table.lower() in airbyte_tables)
+        for table, rows in task.source_tables.items()
+    ]
 
 
 def rewrite_namespace(sql: str, task_name: str, namespace: str) -> str:

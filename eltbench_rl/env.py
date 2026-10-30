@@ -42,8 +42,15 @@ SYSTEM_PROMPT = (
     "Always use absolute paths, and only modify files under /workspace/elt. "
     "When the pipeline is complete, reply without calling a tool: that submits it for grading."
 )
-# ELT-Bench's docker compose network, where its sources and the Airbyte control plane live.
-ELT_BENCH_NETWORK = "elt-docker_elt_network"
+# Internal Docker network for Snowflake runs (docker/sandbox-network.sh): its only ways out are the
+# Airbyte control plane and a proxy that lets HTTPS through to Snowflake and nothing else.
+SANDBOX_NETWORK = "eltbench-sandbox"
+PROXY = "http://eltbench-proxy:8888"
+PROXY_ENV = {
+    name: value
+    for names, value in [(("HTTPS_PROXY", "HTTP_PROXY"), PROXY), (("NO_PROXY",), "airbyte-abctl-control-plane,localhost")]
+    for name in (*names, *(n.lower() for n in names))
+}
 
 
 @dataclass
@@ -53,9 +60,9 @@ class _Rollout:
     workspace: Path
 
 
-def _set_namespace(config_path: Path, destination: Destination, namespace: str) -> None:
+def _update_config(config_path: Path, destination: Destination, values: dict[str, str]) -> None:
     config = yaml.safe_load(config_path.read_text())
-    config[destination.name]["config"][destination.namespace_field] = namespace
+    config[destination.name]["config"].update(values)
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
 
 
@@ -93,13 +100,8 @@ class EltEnvGroupBuilder(EnvGroupBuilder):
         self.stage = stage
         self.snapshot = f"{task.name}__snapshot"
         self.save_snapshot = save_snapshot
-        # Airbyte runs need ELT-Bench's network, other Snowflake runs only the internet, DuckDB nothing.
-        if docker_network:
-            self.docker_network = docker_network
-        elif task.uses_airbyte and stage == "full":
-            self.docker_network = ELT_BENCH_NETWORK
-        else:
-            self.docker_network = "none" if destination == "duckdb" else None
+        # DuckDB runs need no network at all.
+        self.docker_network = docker_network or ("none" if destination == "duckdb" else SANDBOX_NETWORK)
         self.workspace_root = workspace_root
         self.max_turns = max_turns
         self.command_timeout = command_timeout
@@ -120,12 +122,14 @@ class EltEnvGroupBuilder(EnvGroupBuilder):
         workspace = Path(self.workspace_root) / namespace
         # The agent gets what ELT-Bench gives its agents; admin credentials stay on the host.
         shutil.copytree(self.task.input_dir, workspace, ignore=shutil.ignore_patterns("*_credential.json"))
-        _set_namespace(workspace / "config.yaml", destination, namespace)
 
-        sandbox = await DockerSandbox.create(self.docker_image, workspace, self.docker_network)
+        env = PROXY_ENV if self.docker_network == SANDBOX_NETWORK else {}
+        sandbox = await DockerSandbox.create(self.docker_image, workspace, self.docker_network, env)
         self._rollouts.append(_Rollout(sandbox, namespace, workspace))
         from_snapshot = self.snapshot if self.stage == "transform" else None
-        await asyncio.to_thread(destination.create_namespace, namespace, workspace, from_snapshot)
+        # The namespace comes with its own credentials, which replace the shared ones in config.yaml.
+        values = await asyncio.to_thread(destination.create_namespace, namespace, workspace, from_snapshot)
+        _update_config(workspace / "config.yaml", destination, values)
         instruction = self.task.instruction if self.stage == "full" else transform_instruction(self.task.instruction)
 
         bash_tool = HarborBashTool(sandbox, command_timeout=self.command_timeout)
@@ -139,6 +143,7 @@ class EltEnvGroupBuilder(EnvGroupBuilder):
             reward_fn=EltReward(
                 self.task, destination, sandbox, workspace, namespace,
                 check_airbyte_jobs=self.task.uses_airbyte and self.stage == "full",
+                restore_from=from_snapshot,
                 save_snapshot_as=self.snapshot if self.save_snapshot else None,
             ),  # fmt: skip
             # Every command shares one container, so run them in order; retry malformed tool calls.

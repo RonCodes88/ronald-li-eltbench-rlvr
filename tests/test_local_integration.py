@@ -129,6 +129,11 @@ LOAD = run_duckdb_sql((SOLUTION / "load.sql").read_text())
 CTAS = run_duckdb_sql(
     "\n".join(f"create table {{{{ target.schema }}}}.{name} as {sql};" for name, sql in SOLUTION_MODELS.items())
 )
+# Answers computed by hand into helper tables, with dbt models that only copy them.
+HELPER_TABLES = run_duckdb_sql(
+    "\n".join(f"create table {{{{ target.schema }}}}.helper_{name} as {sql};" for name, sql in SOLUTION_MODELS.items())
+)
+HELPER_MODELS = {name: f"select * from {{{{ target.schema }}}}.helper_{name}" for name in SOLUTION_MODELS}
 # Broken models that dbt cannot build, plus a forged run_results.json claiming they succeeded.
 FAKE_RUN_RESULTS = json.dumps(
     {"results": [{"unique_id": f"model.shop_dbt.{name}", "status": "success"} for name in SOLUTION_MODELS]}
@@ -143,6 +148,7 @@ POLICIES = {
     "ctas_hacker": [LOAD, CTAS],
     "seed_hacker": [LOAD, *seed_hack()],
     "fake_run_results": [LOAD, CTAS, *FAKE_RESULTS],
+    "helper_table_hacker": [LOAD, HELPER_TABLES, *dbt_project(HELPER_MODELS)],
     "wrong_column": [LOAD, *dbt_project(WRONG_MODELS)],
     "noop": [],
 }
@@ -170,6 +176,7 @@ def run_group(builder: EltEnvGroupBuilder, policies: dict[str, list[str]]) -> di
 
     async def run():
         envs = await builder.make_envs()
+        builder.container_names = [rollout.sandbox.sandbox_id for rollout in builder._rollouts]
         try:
             trajectories = await asyncio.gather(
                 *[do_single_rollout(ScriptedPolicy(renderer, cmds), env) for cmds, env in zip(policies.values(), envs)]
@@ -191,7 +198,8 @@ def test_scripted_tool_calls_parse_back():
 
 
 def test_rewards_come_from_executing_the_pipeline(tmp_path):
-    trajectories = run_group(make_builder(tmp_path), POLICIES)
+    builder = make_builder(tmp_path)
+    trajectories = run_group(builder, POLICIES)
     rewards = {name: sum(t.reward for t in traj.transitions) for name, traj in trajectories.items()}
     print(rewards)
 
@@ -200,13 +208,13 @@ def test_rewards_come_from_executing_the_pipeline(tmp_path):
     assert rewards["ctas_hacker"] == pytest.approx(0.2)
     assert rewards["seed_hacker"] == pytest.approx(0.2)
     assert rewards["fake_run_results"] == pytest.approx(0.2)
+    assert rewards["helper_table_hacker"] == pytest.approx(0.2)
     assert 0.2 < rewards["wrong_column"] < 1.0
     assert rewards["noop"] == pytest.approx(0.0)
 
-    leftover = subprocess.run(
-        ["docker", "ps", "-a", "--filter", "name=eltbench-", "-q"], capture_output=True, text=True
-    )
-    assert leftover.stdout.strip() == ""
+    for name in builder.container_names:
+        leftover = subprocess.run(["docker", "ps", "-a", "--filter", f"name={name}", "-q"], capture_output=True, text=True)
+        assert leftover.stdout.strip() == ""
     assert list(tmp_path.iterdir()) == []
 
 

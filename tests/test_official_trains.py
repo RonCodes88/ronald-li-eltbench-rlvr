@@ -20,7 +20,8 @@ from tinker_cookbook.rl.rollouts import do_single_rollout
 
 from eltbench_rl import ELT_BENCH_DIR
 from eltbench_rl.destinations import get_destination
-from eltbench_rl.env import EltEnvGroupBuilder
+from eltbench_rl.docker_sandbox import DockerSandbox
+from eltbench_rl.env import PROXY_ENV, SANDBOX_NETWORK, EltEnvGroupBuilder
 from eltbench_rl.tasks import load_tasks
 
 ORACLE = Path(__file__).parent / "oracles" / "trains"
@@ -126,12 +127,44 @@ def run_oracle(builder: EltEnvGroupBuilder, commands: list[str]):
     return asyncio.run(run())
 
 
-def database_exists(name: str) -> bool:
+def snowflake_query(sql: str):
     admin = get_destination("snowflake", str(CREDENTIAL)).connector(None)
     try:
-        return not admin.query(f"show databases like '{name}'").empty
+        return admin.query(sql)
     finally:
         admin.close()
+
+
+def database_exists(name: str) -> bool:
+    return not snowflake_query(f"show databases like '{name}'").empty
+
+
+def test_sandbox_reaches_only_snowflake_and_airbyte(tmp_path):
+    account = json.loads(CREDENTIAL.read_text())["account"]
+    urls = {
+        f"https://{account}.snowflakecomputing.com": True,
+        "http://airbyte-abctl-control-plane:80/api/public/v1/health": True,
+        "https://huggingface.co/datasets/tttjjj/elt_bench": False,  # the public ground truth
+        "https://github.com": False,
+        "https://pypi.org": False,
+    }
+
+    async def check():
+        sandbox = await DockerSandbox.create(IMAGE, tmp_path, SANDBOX_NETWORK, PROXY_ENV)
+        try:
+            codes = {}
+            for url in [*urls, "--noproxy '*' https://huggingface.co"]:
+                result = await sandbox.run_command(f"curl -s -o /dev/null -m 15 -w '%{{http_code}}' {url}", timeout=30)
+                codes[url] = result.stdout
+            return codes
+        finally:
+            await sandbox.cleanup()
+
+    codes = asyncio.run(check())
+    print(codes)
+    for url, reachable in urls.items():
+        assert (codes[url] != "000") == reachable, url
+    assert codes["--noproxy '*' https://huggingface.co"] == "000"
 
 
 def test_oracle_pipeline_scores_one(tmp_path):
@@ -145,6 +178,8 @@ def test_oracle_pipeline_scores_one(tmp_path):
     assert "grading_error" not in metrics
 
     assert not database_exists(namespace)
+    assert snowflake_query(f"show users like '{namespace}_USER'").empty  # per-rollout user and role are gone
+    assert snowflake_query(f"show roles like '{namespace}_ROLE'").empty
     assert count_airbyte_connections() == connections_before
     assert database_exists("trains__snapshot")
 
@@ -157,4 +192,4 @@ def test_transform_stage_from_snapshot_scores_one(tmp_path):
     print(metrics)
 
     assert sum(t.reward for t in trajectory.transitions) == pytest.approx(1.0)
-    assert builder.docker_network is None  # no Airbyte network needed, only the internet
+    assert builder.docker_network == SANDBOX_NETWORK
