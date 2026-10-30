@@ -110,7 +110,7 @@ Still open: answers hardcoded into a model's SQL (for example a `VALUES` list th
 
 ## Adding a warehouse
 
-Write a class with the `Destination` protocol from `eltbench_rl/destinations.py` (`name`, `namespace_field`, `connector()`, `create_namespace()`, `drop_namespace()`, and `save_snapshot()` if you want the transform stage), register it in `get_destination`, and generate task inputs with ELT-Bench's `write_config.py --destination <name>`. ELT-Bench already has `DatabricksConnector` and `RedshiftConnector` in `evaluation/db_connectors.py` for grading. The environment code doesn't change. Only Snowflake and DuckDB are implemented and tested.
+Write a class with the `Destination` protocol from `eltbench_rl/destinations.py` (`name`, `namespace_field`, `connector()`, `create_namespace()`, `drop_namespace()`, `reset_namespace()` for the clean grading run, and `save_snapshot()` for the transform stage), register it in `get_destination`, and generate task inputs with ELT-Bench's `write_config.py --destination <name>`. ELT-Bench already has `DatabricksConnector` and `RedshiftConnector` in `evaluation/db_connectors.py` for grading. The environment code doesn't change. Only Snowflake and DuckDB are implemented and tested.
 
 ## Layout
 
