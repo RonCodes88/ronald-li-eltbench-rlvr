@@ -4,7 +4,7 @@ This is a reinforcement-learning-with-verifiable-rewards (RLVR) environment for 
 
 In each rollout, a model gets an ELT-Bench task and a bash tool inside a Docker sandbox. It must configure Airbyte with Terraform to extract and load the sources into a warehouse, write the dbt transformations, and submit the pipeline. The reward comes from **executing** the result: we re-run the submitted dbt project, then grade the warehouse it leaves behind against ELT-Bench's hidden ground truth, using ELT-Bench's own comparator.
 
-Snowflake (the official destination) and DuckDB (local, credential-free) are supported. Other warehouses plug in through one small class. Design notes, covering the task anatomy, the reward, reward hacking and efficiency, are in [DESIGN.md](DESIGN.md).
+Snowflake (the official destination) and DuckDB (local, credential-free) are supported. Other warehouses plug in through one small class. The design (task anatomy, reward, reward hacking and efficiency) is written up in the accompanying design doc.
 
 ## Install
 
@@ -92,7 +92,7 @@ This follows [ELT-Bench's README](third_party/ELT-Bench/README.md), with fixes f
 
 **Reward.** `0.2·el_frac + 0.1·built_frac + 0.7·col_frac`, where `el_frac` is the share of source tables Airbyte loaded with the right row count, `built_frac` is the share of models our own dbt re-run built, and `col_frac` is the share of ground-truth columns that match, using ELT-Bench's `check_corretness`. As in ELT-Bench, the last two terms only count once every source table is loaded. ELT-Bench's own metrics (SRDEL, SRDT) are logged too.
 
-**Anti-hacking.** Hidden data never enters the sandbox, only tables built by our dbt re-run are graded, and seeds and forged dbt artifacts are rejected. DESIGN.md Step 4 lists what is still open.
+**Anti-hacking.** Hidden data never enters the sandbox, only tables built by our dbt re-run are graded, and seeds and forged dbt artifacts are rejected. Still open: on official tasks the sandbox has internet access, rollouts share one Snowflake role, and the Airbyte check (an `_airbyte_raw_id` column) could be faked by adding that column by hand.
 
 ## Adding a warehouse
 
