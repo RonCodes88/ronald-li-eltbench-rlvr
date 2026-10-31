@@ -44,7 +44,7 @@ The same file also checks the transform stage (below): the correct pipeline save
 ```bash
 uv run python -m eltbench_rl.rollout task=trains destination=snowflake \
     credential_path=third_party/ELT-Bench/setup/destination/snowflake_credential.json \
-    model_name=Qwen/Qwen3.6-35B-A3B:peft:262144 max_trajectory_tokens=200000 max_turns=40
+    model_name=Qwen/Qwen3.6-35B-A3B:peft:262144 max_trajectory_tokens=200000 max_turns=60
 uv run pytest tests/test_official_trains.py -s   # hand-written oracle on the same task: reward 1.0
 ```
 

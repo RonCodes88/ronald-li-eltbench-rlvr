@@ -85,12 +85,13 @@ class EltReward:
 
     async def _rerun_dbt(self) -> tuple[set[str], bool, bool]:
         """Run the agent's dbt project again from its final state; return (built models, has seeds, ok)."""
+        # Agents don't always keep the project under /workspace/elt; take the one edited last.
         found = await self.sandbox.run_command(
-            "find /workspace/elt -name dbt_project.yml -not -path '*/dbt_packages/*'"
+            "find /workspace -name dbt_project.yml -not -path '*/dbt_packages/*' -printf '%T@ %p\\n' | sort -rn"
         )
         if not found.stdout.strip():
             return set(), False, False
-        project = PurePosixPath(found.stdout.split()[0]).parent
+        project = PurePosixPath(found.stdout.split()[1]).parent
         # Delete the artifacts the agent left, so only our own run is trusted.
         result = await self.sandbox.run_command(
             f"cd {project} && rm -f target/run_results.json target/manifest.json && dbt run",

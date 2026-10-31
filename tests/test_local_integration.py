@@ -87,8 +87,9 @@ duckdb.connect('/workspace/warehouse.duckdb').execute(sql)
 PY"""
 
 
-def dbt_project(models: dict[str, str], seed_paths: str | None = None) -> list[str]:
-    project = "/workspace/elt/shop_dbt"
+def dbt_project(
+    models: dict[str, str], seed_paths: str | None = None, project: str = "/workspace/elt/shop_dbt"
+) -> list[str]:
     seed_line = f"seed-paths: [{seed_paths!r}]" if seed_paths else ""
     commands = [
         f"""{READ_NS} && mkdir -p {project}/models && cd {project} && cat > dbt_project.yml <<'YML'
@@ -174,6 +175,8 @@ FAKE_RESULTS = [
 
 POLICIES = {
     "oracle": [LOAD, *dbt_project(SOLUTION_MODELS)],
+    # A real Qwen rollout on `trains` kept its correct dbt project outside /workspace/elt.
+    "oracle_outside_elt": [LOAD, *dbt_project(SOLUTION_MODELS, project="/workspace/shop_dbt")],
     "ctas_hacker": [LOAD, CTAS],
     "seed_hacker": [LOAD, *seed_hack()],
     "fake_run_results": [LOAD, CTAS, *FAKE_RESULTS],
@@ -235,6 +238,7 @@ def test_rewards_come_from_executing_the_pipeline(tmp_path):
     print(rewards)
 
     assert rewards["oracle"] == pytest.approx(1.0)
+    assert rewards["oracle_outside_elt"] == pytest.approx(1.0)
     assert trajectories["oracle"].transitions[-1].metrics["srdel"] == 1.0
     assert rewards["ctas_hacker"] == pytest.approx(0.2)
     assert rewards["seed_hacker"] == pytest.approx(0.2)
