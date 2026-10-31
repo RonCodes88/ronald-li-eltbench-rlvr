@@ -50,7 +50,12 @@ uv run pytest tests/test_official_trains.py -s   # hand-written oracle on the sa
 
 The oracle test also saves `TRAINS__SNAPSHOT`, the task's reference load of its source tables, and then checks that a dbt-only run starting from it scores 1.0 too. The same file checks the sandbox network: Snowflake and the Airbyte gate are reachable, Airbyte itself, HuggingFace, GitHub and PyPI are not, and through the gate a rollout can reach only its own Airbyte workspace.
 
-Official tasks need the 256K-context model variant: with a 64K budget, our first `trains` rollout ran out of tokens after 7 turns. The rollout prints the reward breakdown and saves `result.json` and a transcript under `~/tinker-runs/eltbench_rollouts/`. On the final code, the base Qwen3.6-35B-A3B solved `trains` end to end: it configured Airbyte through the gate with Terraform, waited for both syncs, and wrote a dbt model that computes the answers from the loaded `TRAIN` and `CARS` tables. Reward 1.0 (SRDEL 1, SRDT 1, nothing flagged as hardcoded) in 40 turns and 421 s, of which 30.5 s was grading. An earlier full rollout, before the gate, finished the Airbyte stage but ran out of turns before dbt (reward 0.2), so one rollout per configuration says little about the success rate.
+Official tasks need the 256K-context model variant: with a 64K budget, our first `trains` rollout ran out of tokens after 7 turns. The rollout prints the reward breakdown and saves `result.json` and a transcript under `~/tinker-runs/eltbench_rollouts/`. Results with the base Qwen3.6-35B-A3B vary a lot from rollout to rollout:
+- One rollout configured Airbyte through the gate with Terraform, waited for both syncs, and wrote a dbt model over the loaded `TRAIN` and `CARS` tables. It hit the 40-turn cap right after rewriting the model, and our dbt re-run built it: reward 1.0 (SRDEL 1, SRDT 1, nothing flagged as hardcoded).
+- Another built a correct project (all 20 rows match the ground truth) but kept it in `/workspace/trains_dbt_project`. The grader then only looked under `/workspace/elt`, so it scored 0.2. Grading now finds the project anywhere in `/workspace`.
+- A third set `disable_type_dedupe = true` on the Snowflake destination, so Airbyte wrote only raw tables and stage 1 failed: reward 0.0, as in ELT-Bench.
+
+A full rollout takes about 7 to 9 minutes, of which grading is 2 to 30 s.
 
 **3. A Tinker RL optimization step with execution-derived rewards.** Needs Tinker credentials. The toy run needs nothing else.
 
