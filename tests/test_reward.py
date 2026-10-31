@@ -110,13 +110,13 @@ def test_tables_that_ignore_their_sources_count_as_hardcoded(tmp_path):
     connector = DuckDBDestination().connector(tmp_path)
     outputs = model_outputs(TASK, connector, NAMESPACE, MODELS)
 
-    # As if the run on empty sources had returned exactly these rows too.
-    reward, metrics = grade(TASK, connector, NAMESPACE, MODELS, False, empty_outputs=outputs)
+    # As if the run on one-row sources had returned exactly these rows too.
+    reward, metrics = grade(TASK, connector, NAMESPACE, MODELS, False, probe_outputs=outputs)
     assert reward == pytest.approx(0.2)
     assert metrics["hardcoded_frac"] == 1.0 and metrics["built_frac"] == 0.0
 
-    no_rows = {name: df.iloc[:0] for name, df in outputs.items()}
-    reward, metrics = grade(TASK, connector, NAMESPACE, MODELS, False, empty_outputs=no_rows)
+    one_row = {name: df.iloc[:1] for name, df in outputs.items()}
+    reward, metrics = grade(TASK, connector, NAMESPACE, MODELS, False, probe_outputs=one_row)
     assert reward == pytest.approx(1.0) and metrics["hardcoded_frac"] == 0.0
 
 

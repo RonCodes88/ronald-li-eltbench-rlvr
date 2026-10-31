@@ -9,8 +9,9 @@ RUN wget -qO- https://apt.releases.hashicorp.com/gpg | gpg --dearmor -o /usr/sha
  && apt-get update && apt-get install -y --no-install-recommends terraform \
  && rm -rf /var/lib/apt/lists/*
 
-# duckdb must match the host version pinned in pyproject.toml.
-RUN pip install --no-cache-dir dbt-core dbt-snowflake dbt-duckdb==1.11.1 duckdb==1.5.6 \
+# duckdb must match the host version pinned in pyproject.toml. dbt is pinned to the v1 release the
+# tests run on, since dbt now announces v2 as the default for new installations.
+RUN pip install --no-cache-dir dbt-core==1.12.6 dbt-snowflake==1.12.4 dbt-duckdb==1.11.1 duckdb==1.5.6 \
     snowflake-connector-python pandas pyyaml requests psycopg2-binary pymongo awscli
 
 # Mirror the Airbyte provider so `terraform init` works offline and fast.

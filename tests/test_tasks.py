@@ -1,8 +1,10 @@
+import asyncio
 from pathlib import Path
 
 import pandas as pd
 
 from eltbench_rl import ELT_BENCH_DIR
+from eltbench_rl.env import EltDatasetBuilder
 from eltbench_rl.tasks import elt_bench_instruction, ground_truth_dir, load_tasks, transform_instruction
 
 TOY_BENCH = Path(__file__).parent / "fixtures" / "toy_bench"
@@ -51,3 +53,15 @@ def test_official_ground_truth_download():
 
     assert list(gt.columns)[0] == "TRAIN_ID"
     assert len(gt) == 20
+
+
+def test_each_epoch_gets_its_own_builders():
+    builder = EltDatasetBuilder(
+        bench_dir=str(TOY_BENCH), destination="duckdb", batch_size=2, group_size=4,
+        model_name="Qwen/Qwen3.6-35B-A3B", num_epochs=2,
+    )  # fmt: skip
+    dataset, _ = asyncio.run(builder())
+    [batch] = [dataset.get_batch(i) for i in range(len(dataset))]
+
+    # Both groups of `shop` run at once, so each needs its own builder to clean up after it.
+    assert len(batch) == 2 and batch[0] is not batch[1]

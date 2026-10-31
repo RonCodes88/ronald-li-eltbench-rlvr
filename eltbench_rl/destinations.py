@@ -37,9 +37,9 @@ class Destination(Protocol):
     def has_snapshot(self, snapshot: str) -> bool: ...
 
     def reset_namespace(
-        self, namespace: str, workspace: Path, snapshot: str, tables: list[str], empty: bool = False
+        self, namespace: str, workspace: Path, snapshot: str, tables: list[str], rows: int | None = None
     ) -> None:
-        """Rebuild the namespace with only `tables`, copied from `snapshot` (just their columns if `empty`)."""
+        """Rebuild the namespace with only `tables`, copied from `snapshot` (at most `rows` rows of each)."""
 
 
 def rollout_snapshot(namespace: str) -> str:
@@ -90,11 +90,11 @@ class DuckDBDestination:
         (self.snapshot_dir / f"{rollout_snapshot(namespace)}.duckdb").unlink(missing_ok=True)
 
     def reset_namespace(
-        self, namespace: str, workspace: Path, snapshot: str, tables: list[str], empty: bool = False
+        self, namespace: str, workspace: Path, snapshot: str, tables: list[str], rows: int | None = None
     ) -> None:
         path = workspace / "warehouse.duckdb"
         path.unlink(missing_ok=True)
-        _copy_duckdb_tables(self.snapshot_dir / f"{snapshot}.duckdb", "main", path, namespace, tables, empty)
+        _copy_duckdb_tables(self.snapshot_dir / f"{snapshot}.duckdb", "main", path, namespace, tables, rows)
 
     def save_snapshot(self, namespace: str, workspace: Path, snapshot: str, tables: list[str]) -> None:
         path = self.snapshot_dir / f"{snapshot}.duckdb"
@@ -112,7 +112,7 @@ def _copy_duckdb_tables(
     target: Path,
     target_schema: str,
     tables: list[str] | None = None,
-    empty: bool = False,
+    rows: int | None = None,
 ) -> None:
     """Copy `tables` (default: all of them) from a schema of one DuckDB file into a schema of another."""
     con = duckdb.connect(str(target))
@@ -125,7 +125,7 @@ def _copy_duckdb_tables(
         for table in tables:
             con.execute(
                 f'CREATE TABLE "{target_schema}"."{table}" AS FROM source."{source_schema}"."{table}"'
-                + (" LIMIT 0" if empty else "")
+                + (f" LIMIT {rows}" if rows is not None else "")
             )
     finally:
         con.close()
@@ -185,19 +185,19 @@ class SnowflakeDestination:
             connector.close()
 
     def reset_namespace(
-        self, namespace: str, workspace: Path, snapshot: str, tables: list[str], empty: bool = False
+        self, namespace: str, workspace: Path, snapshot: str, tables: list[str], rows: int | None = None
     ) -> None:
-        self._execute(*self._copy_tables(snapshot, namespace, tables, empty), *self._hand_over(namespace))
+        self._execute(*self._copy_tables(snapshot, namespace, tables, rows), *self._hand_over(namespace))
 
     @staticmethod
-    def _copy_tables(source: str, target: str, tables: list[str], empty: bool = False) -> list[str | list[str]]:
-        # CLONE is zero-copy; LIKE copies only the columns. Cloning tables one by one, all at once,
-        # is faster than cloning the whole database (about 3 s against 5 s for `trains`).
-        how = "LIKE" if empty else "CLONE"
+    def _copy_tables(source: str, target: str, tables: list[str], rows: int | None = None) -> list[str | list[str]]:
+        # CLONE is zero-copy. Cloning tables one by one, all at once, is faster than cloning the
+        # whole database (about 3 s against 5 s for `trains`).
+        copy = "CLONE {}" if rows is None else f"AS SELECT * FROM {{}} LIMIT {rows}"
         return [
             f"CREATE OR REPLACE DATABASE {target}",
             f"CREATE SCHEMA {target}.AIRBYTE_SCHEMA",
-            [f"CREATE TABLE {target}.AIRBYTE_SCHEMA.{t} {how} {source}.AIRBYTE_SCHEMA.{t}" for t in tables],
+            [f"CREATE TABLE {target}.AIRBYTE_SCHEMA.{t} " + copy.format(f"{source}.AIRBYTE_SCHEMA.{t}") for t in tables],
         ]
 
     @staticmethod

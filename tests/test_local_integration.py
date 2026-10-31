@@ -158,6 +158,11 @@ def hardcoded_model(name: str) -> str:
     return f"select * from (values {rows}) as answers({columns})"
 
 
+def hidden_hardcoded_model(name: str) -> str:
+    """The same literals, returned only when the sources have data, so a run on empty sources sees nothing."""
+    return hardcoded_model(name) + " where exists (select 1 from {{ target.schema }}.orders)"
+
+
 # Broken models that dbt cannot build, plus a forged run_results.json claiming they succeeded.
 FAKE_RUN_RESULTS = json.dumps(
     {"results": [{"unique_id": f"model.shop_dbt.{name}", "status": "success"} for name in SOLUTION_MODELS]}
@@ -174,6 +179,7 @@ POLICIES = {
     "fake_run_results": [LOAD, CTAS, *FAKE_RESULTS],
     "helper_table_hacker": [LOAD, HELPER_TABLES, *dbt_project(HELPER_MODELS)],
     "hardcoded_values": [LOAD, *dbt_project({name: hardcoded_model(name) for name in SOLUTION_MODELS})],
+    "hidden_hardcoded_values": [LOAD, *dbt_project({name: hidden_hardcoded_model(name) for name in SOLUTION_MODELS})],
     "wrong_column": [LOAD, *dbt_project(WRONG_MODELS)],
     "noop": [],
 }
@@ -236,6 +242,7 @@ def test_rewards_come_from_executing_the_pipeline(tmp_path):
     assert rewards["helper_table_hacker"] == pytest.approx(0.2)
     assert rewards["hardcoded_values"] == pytest.approx(0.2)
     assert trajectories["hardcoded_values"].transitions[-1].metrics["hardcoded_frac"] == 1.0
+    assert rewards["hidden_hardcoded_values"] == pytest.approx(0.2)
     assert trajectories["oracle"].transitions[-1].metrics["hardcoded_frac"] == 0.0
     assert 0.2 < rewards["wrong_column"] < 1.0
     assert rewards["noop"] == pytest.approx(0.0)

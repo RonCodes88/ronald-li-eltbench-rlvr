@@ -5,6 +5,10 @@ who can reach it. So sandboxes can't reach Airbyte; they reach this gate. A roll
 workspace id as the username and HMAC(GATE_SECRET, workspace id) as the password, which only the
 host can compute. A request goes through only if every workspace, source, destination, connection
 and job it names belongs to that workspace, and list requests are narrowed to it.
+
+Airbyte itself can reach the internet (tasks load flat files from Google Drive), so a source may
+only fetch the files ELT-Bench's tasks list (ALLOWED_URLS, set by docker/sandbox-network.sh) or
+hosts on the local Docker network. Otherwise a rollout could load the public ground truth.
 """
 
 import base64
@@ -23,6 +27,7 @@ API = "/api/public/v1/"
 RESOURCES = {"sources", "destinations", "connections", "jobs", "streams", "health"}
 LISTS = {"sources", "destinations", "connections", "jobs"}
 ID_FIELDS = {"sourceId": "sources", "destinationId": "destinations", "connectionId": "connections"}
+ALLOWED_URLS = set(os.environ.get("ALLOWED_URLS", "").split())
 
 
 def password(workspace_id: str) -> str:
@@ -47,6 +52,19 @@ def workspace_of(kind: str, resource_id: str) -> str | None:
     if kind == "jobs":
         return workspace_of("connections", resource["connectionId"])
     return resource.get("workspaceId")
+
+
+def fetches_unlisted_url(value, key: str = "") -> bool:
+    """Whether a source configuration points at a file or remote host outside ELT-Bench's tasks."""
+    if isinstance(value, dict):
+        return any(fetches_unlisted_url(v, k) for k, v in value.items())
+    if isinstance(value, list):
+        return any(fetches_unlisted_url(v) for v in value)
+    if not isinstance(value, str) or value in ALLOWED_URLS:
+        return False
+    # The File source's `url` may leave out the scheme. Hosts without a dot are local containers.
+    host = urllib.parse.urlsplit(value).hostname or ""
+    return key.lower() == "url" or ("://" in value and "." in host)
 
 
 def allowed(workspace: str, method: str, kind: str, resource_id: str, named: dict) -> bool:
@@ -78,6 +96,8 @@ class Gate(BaseHTTPRequestHandler):
             return self.reply(401, {"message": "sign in with the Airbyte username and password in config.yaml"})
         if not url.path.startswith(API) or not allowed(workspace, self.command, kind, resource_id, named):
             return self.reply(403, {"message": "outside this rollout's Airbyte workspace"})
+        if kind == "sources" and self.command != "GET" and fetches_unlisted_url(named.get("configuration")):
+            return self.reply(403, {"message": "sources may only load the files and hosts given in /workspace/config.yaml"})
         query.pop("workspaceIds", None)
         if kind in LISTS and not resource_id and "connectionId" not in query:
             query["workspaceIds"] = workspace

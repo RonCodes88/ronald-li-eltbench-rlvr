@@ -179,8 +179,12 @@ for name, (login, method, path, body) in json.load(open("/workspace/requests.jso
 PY"""
 
 
+GROUND_TRUTH_URL = "https://huggingface.co/datasets/tttjjj/elt_bench/resolve/main/gt_snowflake/trains/trains.csv"
+
+
 def test_airbyte_gate_keeps_rollouts_in_their_own_workspace(tmp_path):
     mine, other = airbyte.create_workspace("gate_test_mine"), airbyte.create_workspace("gate_test_other")
+    file_source = {"sourceType": "file", "format": "csv", "provider": {"storage": "HTTPS"}, "dataset_name": "train"}
     requests = {
         "own workspace": (mine, "GET", f"workspaces/{mine['workspace_id']}", None),
         "other workspace": (mine, "GET", f"workspaces/{other['workspace_id']}", None),
@@ -188,6 +192,11 @@ def test_airbyte_gate_keeps_rollouts_in_their_own_workspace(tmp_path):
         "source in other workspace": (mine, "POST", "sources", {"workspaceId": other["workspace_id"], "name": "x"}),
         "wrong password": ({**mine, "password": "guess"}, "GET", f"workspaces/{mine['workspace_id']}", None),
         "Airbyte's internal API": (mine, "POST", "../../v1/workspaces/list", {}),
+        # Airbyte can reach the internet, so a source could load the public ground truth.
+        "source loading the ground truth": (
+            mine, "POST", "sources",
+            {"workspaceId": mine["workspace_id"], "name": "x", "configuration": {**file_source, "url": GROUND_TRUTH_URL}},
+        ),  # fmt: skip
     }
     (tmp_path / "requests.json").write_text(json.dumps(requests))
 
@@ -212,6 +221,7 @@ def test_airbyte_gate_keeps_rollouts_in_their_own_workspace(tmp_path):
         "source in other workspace": 403,
         "wrong password": 401,
         "Airbyte's internal API": 403,
+        "source loading the ground truth": 403,
     }
 
 

@@ -9,7 +9,8 @@ Snowflake (the official destination) and DuckDB (local, credential-free) are sup
 ## Install
 
 ```bash
-git clone --recurse-submodules <this repo> && cd <this repo>
+git clone --recurse-submodules https://github.com/RonCodes88/ronald-li-eltbench-rlvr.git
+cd ronald-li-eltbench-rlvr
 uv sync                                    # Python 3.12, pinned deps incl. tinker-cookbook==0.5.8
 docker build -t eltbench-rl docker/        # sandbox image: dbt (snowflake, duckdb), terraform, offline Airbyte provider
 ```
@@ -31,13 +32,14 @@ uv run pytest            # the official-task test skips itself unless the offici
 | Hardcoded the answers as dbt seeds | 0.2 |
 | Forged dbt `run_results.json` | 0.2 |
 | Computed the answers by hand into helper tables, with dbt models that copy them | 0.2 (1.0 before the clean re-run) |
-| Typed the answers into the models as a `VALUES` list | 0.2 (1.0 without the empty-source run) |
+| Typed the answers into the models as a `VALUES` list | 0.2 |
+| The same, but hidden when the sources are empty (`WHERE EXISTS (SELECT 1 FROM orders)`) | 0.2 (1.0 with an empty-source check instead of the one-row run) |
 | One model partly wrong | 0.79 |
 | Did nothing | 0.0 |
 
 The same file also checks the transform stage (below): the correct pipeline saves a snapshot of its loaded sources, and a second group starts from that snapshot, where dbt alone scores 1.0 and doing nothing scores 0.2. Another test edits the loaded sources so that a wrong model gives the right answers: that scores 1.0 when grading uses the rollout's own load, and only the wrong model's 0.79 once a reference load exists.
 
-**2. Credentialed rollout on an official ELT-Bench task.** Needs the Official setup below and `TINKER_API_KEY`.
+**2. Credentialed rollout on an official ELT-Bench task.** Needs the Official setup below and Tinker credentials (`TINKER_API_KEY`, or `tinker auth login`).
 
 ```bash
 uv run python -m eltbench_rl.rollout task=trains destination=snowflake \
@@ -50,7 +52,7 @@ The oracle test also saves `TRAINS__SNAPSHOT`, the task's reference load of its 
 
 Official tasks need the 256K-context model variant: with a 64K budget, our first `trains` rollout ran out of tokens after 7 turns. The rollout prints the reward breakdown and saves `result.json` and a transcript under `~/tinker-runs/eltbench_rollouts/`. On the final code, the base Qwen3.6-35B-A3B solved `trains` end to end: it configured Airbyte through the gate with Terraform, waited for both syncs, and wrote a dbt model that computes the answers from the loaded `TRAIN` and `CARS` tables. Reward 1.0 (SRDEL 1, SRDT 1, nothing flagged as hardcoded) in 40 turns and 421 s, of which 30.5 s was grading. An earlier full rollout, before the gate, finished the Airbyte stage but ran out of turns before dbt (reward 0.2), so one rollout per configuration says little about the success rate.
 
-**3. A Tinker RL optimization step with execution-derived rewards.** Needs `TINKER_API_KEY`.
+**3. A Tinker RL optimization step with execution-derived rewards.** Needs Tinker credentials. The toy run needs nothing else.
 
 ```bash
 uv run python -m eltbench_rl.train bench_dir=tests/fixtures/toy_bench destination=duckdb tasks=shop \
@@ -67,7 +69,7 @@ In our toy run the group's rewards were `[1.0, 1.0, 0.2, 1.0]`. On the official 
 
 This follows [ELT-Bench's README](third_party/ELT-Bench/README.md), with fixes for current Airbyte. Credential files live in the ELT-Bench submodule and are never committed.
 
-1. **Snowflake.** A trial account works.
+1. **Snowflake.** Use a [trial account](https://signup.snowflake.com/). Snowflake is phasing out password sign-in for service users on other accounts ([timeline](https://docs.snowflake.com/en/user-guide/security-mfa-rollout)), and both ELT-Bench's setup and our per-rollout users sign in with passwords (`TYPE = LEGACY_SERVICE`); trial accounts are exempt.
    - Create an admin user with a password that has `SYSADMIN` and `SECURITYADMIN`.
    - Put it in `third_party/ELT-Bench/setup/destination/snowflake_credential.json` as `{"account", "user", "password", "role": "sysadmin", "warehouse": "AIRBYTE_WAREHOUSE"}`.
    - Run ELT-Bench's `setup/destination/setup.sql` as that user. It creates `AIRBYTE_ROLE`, `AIRBYTE_USER` and `AIRBYTE_WAREHOUSE`.
@@ -90,10 +92,12 @@ This follows [ELT-Bench's README](third_party/ELT-Bench/README.md), with fixes f
    cd ../elt-docker && docker compose up -d python-rest-api   # or all services for other tasks
    docker network connect elt-docker_elt_network airbyte-abctl-control-plane
    ```
-5. **Sandbox network.** `docker/sandbox-network.sh` (once). It creates an internal Docker network whose only exits are a proxy that lets HTTPS through to `*.snowflakecomputing.com`, and the Airbyte gate (`docker/airbyte-gate/`), which keeps each rollout inside its own Airbyte workspace. It also writes the gate's signing secret to `~/.eltbench/airbyte_gate_secret`. If you set up the network before the gate existed, run `docker network disconnect eltbench-sandbox airbyte-abctl-control-plane`, then just the gate lines of the script.
+5. **Sandbox network.** `docker/sandbox-network.sh` (safe to run again). It creates an internal Docker network whose only exits are a proxy that lets HTTPS through to `*.snowflakecomputing.com`, and the Airbyte gate (`docker/airbyte-gate/`), which keeps each rollout inside its own Airbyte workspace and lets sources load only the files ELT-Bench's tasks list. It also writes the gate's signing secret to `~/.eltbench/airbyte_gate_secret`.
 6. **Task inputs.** `cd third_party/ELT-Bench/setup && uv run --project ../../.. python write_config.py --destination snowflake`. Ground-truth CSVs download automatically from HuggingFace (`tttjjj/elt_bench`) on first use.
 
 ## How it works
+
+**What gets graded.** The submission is the final state of the rollout: the source tables in its namespace, the Airbyte syncs, and the dbt project under `/workspace/elt`, which grading runs again. So a project that builds counts even if the agent's own last `dbt run` didn't happen, which is more lenient than ELT-Bench's evaluation of the warehouse as the agent left it, and is needed anyway so that only tables our run builds can score.
 
 **Episode.** Each rollout gets a copy of the task bundle (without admin credentials), its own warehouse namespace `<task>__<uuid8>`, its own Airbyte workspace, and its own container. On Snowflake the namespace is a database owned by a throwaway role and user made for this rollout, and their credentials replace the shared `AIRBYTE_USER` in the rollout's `config.yaml`. The Airbyte block of `config.yaml` points at the gate instead of Airbyte, with the workspace ID as the username and an HMAC of it as the password. The container sits on the internal `eltbench-sandbox` network (the gate, plus Snowflake through the proxy), or on no network at all for DuckDB. The model's only tool is the cookbook's `HarborBashTool`. The episode ends when the model replies without a tool call, which submits the pipeline, or when it hits 100 turns, the token budget, or too many malformed tool calls in a row. Cleanup runs `terraform destroy`, deletes the Airbyte workspace, drops the namespace (and its role and user) and removes the container.
 
@@ -106,9 +110,10 @@ This follows [ELT-Bench's README](third_party/ELT-Bench/README.md), with fixes f
 - Each rollout's Snowflake user can only see its own database, and through the gate it can only see and change its own Airbyte workspace. So it can't read or sabotage a sibling's tables or connections, which in GRPO would raise its own advantage.
 - Stage 1 asks Airbyte which streams it actually synced into this namespace, so loading around Airbyte doesn't count, and checks each source has exactly its schema's columns, so a source can't be pointed at another file with the same row count (for `trains`, the public ground-truth CSV).
 - Before grading, the namespace is rebuilt from a snapshot of only the source tables, and our own dbt run rebuilds every model from them. Hand-made tables, helper tables and staged files don't survive, and forged dbt artifacts and seeds are rejected. The snapshot is the task's reference load when one exists (always in transform mode), so source values edited after loading don't count either.
-- If anything matches the ground truth, dbt runs once more on empty copies of the sources. A model that returns the same rows without any data has its answers typed in, and counts as not built.
+- If anything matches the ground truth, dbt runs once more on the sources cut down to one row each. A model that returns the same rows from one row of data as from all of it has its answers typed in, and counts as not built. This also catches answers hidden behind a check that the sources aren't empty, which a run on empty sources would miss.
+- Airbyte can reach the internet (`trains` loads a file from Google Drive), so the gate only lets a source load the files ELT-Bench's tasks list, or hosts on the local Docker network. A source pointed at the public ground truth gets a 403.
 
-Still open: a full-mode run without a reference load can still edit its loaded sources (the reference closes this); a model that hardcodes answers but hides them when the sources are empty (for example `WHERE EXISTS (SELECT 1 FROM source)`) gets past the empty-source run; and a rollout can still make Airbyte fetch any public URL, though only into its own workspace and namespace.
+Still open: a full-mode run without a reference load can still edit its loaded sources (the reference closes this). A model could also compute the answers itself during the episode and type them in behind a check that looks at the data (for example `WHERE (SELECT COUNT(*) FROM orders) > 1`). Without a reference solution to run on changed data, an outcome check can't tell that apart from a real transformation, but it still means the model computed the answer from the sources.
 
 ## Adding a warehouse
 

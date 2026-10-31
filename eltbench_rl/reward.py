@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 EL_WEIGHT, BUILT_WEIGHT, COLUMN_WEIGHT = 0.2, 0.1, 0.7
 AIRBYTE_COLUMN = "_airbyte_raw_id"
+PROBE_ROWS = 1  # rows kept of each source table for the hardcoding check
 
 
 @dataclass
@@ -36,8 +37,9 @@ class EltReward:
     has to compute every model from the sources: tables the agent made by hand, staged files and
     anything else it left in the warehouse are gone. The snapshot is the task's reference load when
     there is one, so source values the agent edited after loading don't count either. If any table
-    matches the ground truth, dbt runs once more on empty copies of the sources: a model that
-    returns the same rows without any data has its answers hardcoded.
+    matches the ground truth, dbt runs once more on sources cut down to one row each: a model that
+    returns the same rows from one row of data as from all of it has its answers hardcoded, even
+    if it hides them when the sources are empty.
 
     Same shape as the cookbook's HarborReward: called once at episode end, before the sandbox goes away.
     """
@@ -70,10 +72,10 @@ class EltReward:
                 outputs = await asyncio.to_thread(self._with_connector, model_outputs, built_models)
             reward, metrics = score(self.task, loaded, built_models, has_seeds, outputs)
             if metrics["col_frac"] > 0:
-                await self._reset(snapshot, empty=True)
-                empty_built, _, _ = await self._rerun_dbt()
-                empty_outputs = await asyncio.to_thread(self._with_connector, model_outputs, empty_built)
-                reward, metrics = score(self.task, loaded, built_models, has_seeds, outputs, empty_outputs)
+                await self._reset(snapshot, rows=PROBE_ROWS)
+                probe_built, _, _ = await self._rerun_dbt()
+                probe_outputs = await asyncio.to_thread(self._with_connector, model_outputs, probe_built)
+                reward, metrics = score(self.task, loaded, built_models, has_seeds, outputs, probe_outputs)
         except Exception as e:
             logger.error("ELT-Bench grading failed for %s: %s", self.namespace, e)
             return 0.0, {"grading_error": 1.0}
@@ -120,9 +122,9 @@ class EltReward:
         self.destination.save_snapshot(self.namespace, self.workspace, own, tables)
         return own
 
-    async def _reset(self, snapshot: str, empty: bool = False) -> None:
+    async def _reset(self, snapshot: str, rows: int | None = None) -> None:
         tables = list(self.task.source_tables)
-        await asyncio.to_thread(self.destination.reset_namespace, self.namespace, self.workspace, snapshot, tables, empty)
+        await asyncio.to_thread(self.destination.reset_namespace, self.namespace, self.workspace, snapshot, tables, rows)
 
     def _with_connector(self, fn, *args):
         connector = self.destination.connector(self.workspace)
@@ -139,12 +141,12 @@ def grade(
     built_models: set[str],
     has_seeds: bool,
     airbyte_tables: set[str] | None = None,
-    empty_outputs: dict[str, pd.DataFrame] | None = None,
+    probe_outputs: dict[str, pd.DataFrame] | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Check stage 1 and score the tables in `namespace` in one go (see `score`)."""
     loaded = sources_loaded(task, connector, namespace, airbyte_tables)
     outputs = model_outputs(task, connector, namespace, built_models) if all(loaded) else {}
-    return score(task, loaded, built_models, has_seeds, outputs, empty_outputs)
+    return score(task, loaded, built_models, has_seeds, outputs, probe_outputs)
 
 
 def score(
@@ -153,26 +155,26 @@ def score(
     built_models: set[str],
     has_seeds: bool,
     outputs: dict[str, pd.DataFrame],
-    empty_outputs: dict[str, pd.DataFrame] | None = None,
+    probe_outputs: dict[str, pd.DataFrame] | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Score a rollout against the task's hidden evaluation data.
 
     `loaded` is stage 1 per source table (`sources_loaded`). Stage 2 only counts once stage 1
     passes (ELT-Bench's rule), and only for tables the re-executed dbt project built, so hand-made
     or stale tables earn nothing. `outputs` are those tables as `model_outputs` read them. A table
-    whose rows are also in `empty_outputs`, what the same model returned when every source table
-    was empty, doesn't depend on the sources: it is hardcoded and counts as not built.
+    whose rows are also in `probe_outputs`, what the same model returned when every source table
+    was cut down to one row, doesn't depend on the sources: it is hardcoded and counts as not built.
     """
     el_frac = sum(loaded) / len(loaded)
     srdel = float(all(loaded))
 
     gt_tables = ground_truth_tables(task)
     if srdel and not has_seeds:
-        empty_outputs = empty_outputs or {}
+        probe_outputs = probe_outputs or {}
         hardcoded = {
             table
             for table, df in outputs.items()
-            if len(df) and table in empty_outputs and _rows(df) == _rows(empty_outputs[table])
+            if len(df) and table in probe_outputs and _rows(df) == _rows(probe_outputs[table])
         }
         built = [table.lower() in built_models and table not in hardcoded for table in gt_tables]
         col_fracs = [

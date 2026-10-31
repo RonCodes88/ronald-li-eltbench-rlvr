@@ -236,6 +236,9 @@ class EltDatasetBuilder(RLDatasetBuilder):
 
     async def __call__(self) -> tuple[RLDataset, RLDataset | None]:
         names = [name.strip() for name in self.tasks.split(",") if name.strip()] or None
+        tasks = load_tasks(Path(self.bench_dir), self.destination, names)
+        # A new builder per group: a builder cleans up every rollout it made, so two groups in
+        # flight must never share one.
         builders = [
             EltEnvGroupBuilder(
                 task=task,
@@ -253,6 +256,7 @@ class EltDatasetBuilder(RLDatasetBuilder):
                 max_generation_tokens=self.max_generation_tokens,
                 stage=self.stage,
             )
-            for task in load_tasks(Path(self.bench_dir), self.destination, names)
+            for _ in range(self.num_epochs)
+            for task in tasks
         ]
-        return EltDataset(builders * self.num_epochs, self.batch_size), None
+        return EltDataset(builders, self.batch_size), None
